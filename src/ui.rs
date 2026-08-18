@@ -5,6 +5,20 @@ use std::{sync::Arc, time::Duration};
 
 slint::include_modules!();
 
+#[derive(Default)]
+struct StateRefreshCache {
+    initialized: bool,
+    snapshots: Vec<ToolSnapshot>,
+    manager_memory: Option<MemoryValue>,
+}
+
+#[derive(Default)]
+struct LogRefreshCache {
+    initialized: bool,
+    selected_index: Option<i32>,
+    log_text: String,
+}
+
 pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
     let window = AppWindow::new()?;
     let tray = KeeperTray::new()?;
@@ -15,14 +29,28 @@ pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
 
     wire_window(&window, supervisor.clone());
     wire_tray(&tray, &window, supervisor.clone());
-    refresh(&window, &supervisor, chinese);
+    let mut state_cache = StateRefreshCache::default();
+    refresh_state(&window, &supervisor, chinese, &mut state_cache);
+    let mut log_cache = LogRefreshCache::default();
+    refresh_log(&window, &supervisor, chinese, &mut log_cache);
 
     let weak_window = window.as_weak();
-    let refresh_supervisor = supervisor.clone();
-    let timer = Timer::default();
-    timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+    let state_supervisor = supervisor.clone();
+    let state_timer = Timer::default();
+    state_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
         if let Some(window) = weak_window.upgrade() {
-            refresh(&window, &refresh_supervisor, chinese);
+            refresh_state(&window, &state_supervisor, chinese, &mut state_cache);
+        }
+    });
+
+    let weak_window = window.as_weak();
+    let log_supervisor = supervisor.clone();
+    let log_timer = Timer::default();
+    log_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        if let Some(window) = weak_window.upgrade()
+            && window.window().is_visible()
+        {
+            refresh_log(&window, &log_supervisor, chinese, &mut log_cache);
         }
     });
 
@@ -32,7 +60,8 @@ pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
     }
     let result = slint::run_event_loop();
     supervisor.shutdown();
-    drop(timer);
+    drop(log_timer);
+    drop(state_timer);
     drop(tray);
     drop(window);
     result.map_err(Into::into)
@@ -67,11 +96,13 @@ fn wire_window(window: &AppWindow, supervisor: Arc<Supervisor>) {
     window.on_stop_all(move || action.stop_all());
     let action = supervisor.clone();
     window.on_restart_all(move || action.restart_all());
+    let refresh_weak = window.as_weak();
     let action = supervisor.clone();
-    window.on_refresh_memory(move || action.sample_memory());
-    let action = supervisor.clone();
-    window.on_open_config(move || {
-        let _ = action.open_config();
+    window.on_refresh_memory(move || {
+        if let Some(window) = refresh_weak.upgrade() {
+            window.set_memory_refreshing(true);
+        }
+        action.sample_memory();
     });
     let action = supervisor.clone();
     window.on_open_log_file(move |index| {
@@ -125,54 +156,88 @@ fn wire_tray(tray: &KeeperTray, window: &AppWindow, supervisor: Arc<Supervisor>)
     });
 }
 
-fn refresh(window: &AppWindow, supervisor: &Supervisor, chinese: bool) {
+fn refresh_state(
+    window: &AppWindow,
+    supervisor: &Supervisor,
+    chinese: bool,
+    cache: &mut StateRefreshCache,
+) {
     let snapshots = supervisor.snapshots();
-    let selected = window.get_selected_index();
-    let mut rows: Vec<ToolRow> = snapshots
-        .iter()
-        .map(|snapshot| row_from_snapshot(snapshot, chinese))
-        .collect();
-    rows.push(ToolRow {
-        name: tr(chinese, "Tool Manager", "工具管理器").into(),
-        status: tr(chinese, "Running", "运行中").into(),
-        memory: format_memory(supervisor.manager_memory(), chinese).into(),
-        accent: slint::Color::from_rgb_u8(55, 190, 142),
-        pid: std::process::id() as i32,
-        manager: true,
-    });
-    window.set_tools(ModelRc::new(VecModel::from(rows)));
-    let running = snapshots
-        .iter()
-        .filter(|tool| tool.state == ToolState::Running)
-        .count();
-    let crashed = snapshots
-        .iter()
-        .filter(|tool| tool.state == ToolState::Crashed)
-        .count();
-    let summary = if chinese {
-        format!(
-            "{running} 个运行中  /  共 {} 个  /  {crashed} 个需关注",
-            snapshots.len()
-        )
-    } else {
-        format!(
-            "{running} running  /  {} total  /  {crashed} attention",
-            snapshots.len()
-        )
-    };
-    window.set_summary(summary.into());
-    if selected >= 0 && (selected as usize) < supervisor.tool_count() {
-        window.set_log_text(supervisor.log_snapshot(selected as usize).into());
-    } else {
-        window.set_log_text(
-            tr(
-                chinese,
-                "Select a tool to inspect its live output.",
-                "选择一个工具以查看实时输出。",
-            )
-            .into(),
+    let manager_memory = supervisor.manager_memory();
+
+    if !cache.initialized
+        || cache.snapshots != snapshots
+        || cache.manager_memory != Some(manager_memory)
+    {
+        let mut rows: Vec<ToolRow> = snapshots
+            .iter()
+            .map(|snapshot| row_from_snapshot(snapshot, chinese))
+            .collect();
+        rows.push(ToolRow {
+            name: tr(chinese, "Tool Manager", "工具管理器").into(),
+            status: tr(chinese, "Running", "运行中").into(),
+            memory: format_memory(manager_memory, chinese).into(),
+            accent: slint::Color::from_rgb_u8(55, 190, 142),
+            pid: std::process::id() as i32,
+            manager: true,
+        });
+        window.set_tools(ModelRc::new(VecModel::from(rows)));
+        window.set_memory_refreshing(
+            manager_memory == MemoryValue::Pending
+                || snapshots
+                    .iter()
+                    .any(|tool| tool.memory == MemoryValue::Pending),
         );
+
+        let running = snapshots
+            .iter()
+            .filter(|tool| tool.state == ToolState::Running)
+            .count();
+        let crashed = snapshots
+            .iter()
+            .filter(|tool| tool.state == ToolState::Crashed)
+            .count();
+        let summary = if chinese {
+            format!(
+                "{running} 个运行中  /  共 {} 个  /  {crashed} 个需关注",
+                snapshots.len()
+            )
+        } else {
+            format!(
+                "{running} running  /  {} total  /  {crashed} attention",
+                snapshots.len()
+            )
+        };
+        window.set_summary(summary.into());
+        cache.snapshots.clone_from(&snapshots);
+        cache.manager_memory = Some(manager_memory);
     }
+    cache.initialized = true;
+}
+
+fn refresh_log(
+    window: &AppWindow,
+    supervisor: &Supervisor,
+    chinese: bool,
+    cache: &mut LogRefreshCache,
+) {
+    let selected = window.get_selected_index();
+    let log_text = if selected >= 0 && (selected as usize) < supervisor.tool_count() {
+        supervisor.log_snapshot(selected as usize)
+    } else {
+        tr(
+            chinese,
+            "Select a tool to inspect its live output.",
+            "选择一个工具以查看实时输出。",
+        )
+        .into()
+    };
+    if !cache.initialized || cache.selected_index != Some(selected) || cache.log_text != log_text {
+        window.set_log_text(log_text.clone().into());
+        cache.selected_index = Some(selected);
+        cache.log_text = log_text;
+    }
+    cache.initialized = true;
 }
 
 fn row_from_snapshot(snapshot: &ToolSnapshot, chinese: bool) -> ToolRow {

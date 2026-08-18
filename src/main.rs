@@ -21,12 +21,28 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let (config_override, check_only, show_window) = parse_args()?;
+    let args = parse_args()?;
+    if args.elevated_helper {
+        #[cfg(windows)]
+        {
+            let manifest = args
+                .manifest
+                .context("--elevated-helper requires --manifest")?;
+            let state_directory = args
+                .state_directory
+                .context("--elevated-helper requires --state-dir")?;
+            return core::elevated::run_helper(&manifest, &state_directory);
+        }
+        #[cfg(not(windows))]
+        anyhow::bail!("--elevated-helper is supported on Windows only");
+    }
+
+    let config_override = args.config;
     let paths = platform::paths(config_override)?;
     let config = AppConfig::load_or_create(&paths.config_file)
         .with_context(|| format!("failed to load {}", paths.config_file.display()))?;
 
-    if check_only {
+    if args.check_only {
         if ui::is_chinese_locale() {
             println!("配置有效：{}", paths.config_file.display());
         } else {
@@ -38,33 +54,54 @@ fn run() -> Result<()> {
     platform::configure_autostart(config.manager.start_with_system, &paths.config_file)?;
     let platform = platform::adapter();
     let supervisor = Arc::new(Supervisor::new(config, paths, platform)?);
-    ui::run(supervisor, show_window)
+    ui::run(supervisor, args.show_window)
 }
 
-fn parse_args() -> Result<(Option<PathBuf>, bool, bool)> {
-    let mut config = None;
-    let mut check_only = false;
-    let mut show_window = false;
+#[derive(Default)]
+struct Args {
+    config: Option<PathBuf>,
+    check_only: bool,
+    show_window: bool,
+    elevated_helper: bool,
+    manifest: Option<PathBuf>,
+    state_directory: Option<PathBuf>,
+}
+
+fn parse_args() -> Result<Args> {
+    let mut parsed = Args::default();
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_string_lossy().as_ref() {
             "--config" => {
-                config = Some(PathBuf::from(
+                parsed.config = Some(PathBuf::from(
                     args.next().context("--config requires a path")?,
                 ));
             }
-            "--check-config" => check_only = true,
-            "--show" => show_window = true,
+            "--check-config" => parsed.check_only = true,
+            "--show" => parsed.show_window = true,
+            "--elevated-helper" => parsed.elevated_helper = true,
+            "--manifest" => {
+                parsed.manifest = Some(PathBuf::from(
+                    args.next().context("--manifest requires a path")?,
+                ));
+            }
+            "--state-dir" => {
+                parsed.state_directory = Some(PathBuf::from(
+                    args.next().context("--state-dir requires a path")?,
+                ));
+            }
             "--version" | "-V" => {
                 println!("win-keeper {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--help" | "-h" => {
-                println!("win-keeper [--config PATH] [--check-config] [--show]");
+                println!(
+                    "win-keeper [--config PATH] [--check-config] [--show] [--elevated-helper --manifest PATH --state-dir PATH]"
+                );
                 std::process::exit(0);
             }
             unknown => anyhow::bail!("unknown argument: {unknown}"),
         }
     }
-    Ok((config, check_only, show_window))
+    Ok(parsed)
 }

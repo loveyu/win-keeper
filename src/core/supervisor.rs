@@ -4,6 +4,7 @@ use super::{
 };
 use crate::platform::{AppPaths, PlatformAdapter, ProcessGuard};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader},
@@ -17,7 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolState {
     Stopped,
     Starting,
@@ -27,7 +29,8 @@ pub enum ToolState {
     Crashed,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "bytes")]
 pub enum MemoryValue {
     Idle,
     Pending,
@@ -35,7 +38,7 @@ pub enum MemoryValue {
     Unavailable,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolSnapshot {
     pub name: String,
     pub state: ToolState,
@@ -55,6 +58,8 @@ enum Control {
     Start,
     Stop,
     Restart,
+    #[cfg(windows)]
+    SampleMemory,
     Shutdown,
 }
 
@@ -64,6 +69,7 @@ struct ToolHandle {
     log: Arc<ToolLog>,
     control: Sender<Control>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
+    external_log: bool,
 }
 
 pub struct Supervisor {
@@ -100,6 +106,30 @@ impl Supervisor {
                 config.manager.log_buffer_lines,
             )?);
             let (tx, rx) = mpsc::channel();
+            #[cfg(windows)]
+            let external_log = tool.admin;
+            #[cfg(not(windows))]
+            let external_log = false;
+            #[cfg(windows)]
+            let worker = if tool.admin {
+                spawn_elevated_proxy_worker(
+                    tool.clone(),
+                    runtime.clone(),
+                    log.clone(),
+                    rx,
+                    paths.state_directory.clone(),
+                )
+            } else {
+                spawn_worker(
+                    tool.clone(),
+                    runtime.clone(),
+                    log.clone(),
+                    rx,
+                    platform.clone(),
+                    Duration::from_millis(config.manager.stop_timeout_ms),
+                )
+            };
+            #[cfg(not(windows))]
             let worker = spawn_worker(
                 tool.clone(),
                 runtime.clone(),
@@ -114,6 +144,7 @@ impl Supervisor {
                 log,
                 control: tx,
                 worker: Mutex::new(Some(worker)),
+                external_log,
             };
             tools.push(handle);
         }
@@ -189,7 +220,13 @@ impl Supervisor {
     pub fn log_snapshot(&self, index: usize) -> String {
         self.tools
             .get(index)
-            .map(|tool| tool.log.snapshot())
+            .map(|tool| {
+                if tool.external_log {
+                    tool.log.snapshot_external()
+                } else {
+                    tool.log.snapshot()
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -231,6 +268,17 @@ impl Supervisor {
         });
 
         for tool in &self.tools {
+            #[cfg(windows)]
+            if tool.config.admin {
+                let mut runtime = tool.runtime.lock().unwrap();
+                if runtime.state == ToolState::Running {
+                    runtime.memory = MemoryValue::Pending;
+                    let _ = tool.control.send(Control::SampleMemory);
+                } else {
+                    runtime.memory = MemoryValue::Idle;
+                }
+                continue;
+            }
             let pid = {
                 let mut runtime = tool.runtime.lock().unwrap();
                 if runtime.state == ToolState::Running {
@@ -318,6 +366,8 @@ fn worker_loop(
                 runtime.lock().unwrap().state = ToolState::Restarting;
                 stop_process(&mut process, &runtime, &log, stop_timeout);
             }
+            #[cfg(windows)]
+            Ok(Control::SampleMemory) => {}
             Ok(Control::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 stop_process(&mut process, &runtime, &log, stop_timeout);
                 break;
@@ -399,6 +449,93 @@ fn worker_loop(
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn spawn_elevated_proxy_worker(
+    config: ToolConfig,
+    runtime: Arc<Mutex<Runtime>>,
+    log: Arc<ToolLog>,
+    receiver: Receiver<Control>,
+    state_directory: PathBuf,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("elevated-proxy-{}", config.name))
+        .spawn(move || {
+            use crate::core::elevated::{ElevatedCommand, read_state, send_command};
+
+            let mut desired_running = config.auto_start;
+            let mut unavailable_since = Some(Instant::now());
+            if desired_running {
+                runtime.lock().unwrap().state = ToolState::Starting;
+                if let Err(error) =
+                    send_command(&state_directory, &config.name, ElevatedCommand::Start)
+                {
+                    log.write(
+                        "manager",
+                        &format!("failed to contact elevated helper: {error:#}"),
+                    );
+                }
+            }
+
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(250)) {
+                    Ok(Control::Start) => {
+                        desired_running = true;
+                        runtime.lock().unwrap().state = ToolState::Starting;
+                        let _ =
+                            send_command(&state_directory, &config.name, ElevatedCommand::Start);
+                    }
+                    Ok(Control::Stop) => {
+                        desired_running = false;
+                        runtime.lock().unwrap().state = ToolState::Stopping;
+                        let _ = send_command(&state_directory, &config.name, ElevatedCommand::Stop);
+                    }
+                    Ok(Control::Restart) => {
+                        desired_running = true;
+                        runtime.lock().unwrap().state = ToolState::Restarting;
+                        let _ =
+                            send_command(&state_directory, &config.name, ElevatedCommand::Restart);
+                    }
+                    Ok(Control::SampleMemory) => {
+                        let _ = send_command(
+                            &state_directory,
+                            &config.name,
+                            ElevatedCommand::SampleMemory,
+                        );
+                    }
+                    Ok(Control::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = send_command(&state_directory, &config.name, ElevatedCommand::Stop);
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+
+                match read_state(&state_directory, &config.name) {
+                    Ok(Some(state)) if state.is_fresh() => {
+                        unavailable_since = None;
+                        let mut current = runtime.lock().unwrap();
+                        current.state = state.snapshot.state;
+                        current.pid = state.snapshot.pid;
+                        current.memory = state.snapshot.memory;
+                    }
+                    Ok(_) | Err(_) => {
+                        let since = unavailable_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_secs(8) {
+                            let mut current = runtime.lock().unwrap();
+                            current.state = if desired_running {
+                                ToolState::Crashed
+                            } else {
+                                ToolState::Stopped
+                            };
+                            current.pid = None;
+                            current.memory = MemoryValue::Unavailable;
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to create elevated proxy thread")
 }
 
 fn start_process(

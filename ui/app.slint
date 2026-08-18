@@ -1,4 +1,4 @@
-import { Button, ScrollView } from "std-widgets.slint";
+import { Button, ScrollView, TextEdit } from "std-widgets.slint";
 
 export struct ToolRow {
     name: string,
@@ -12,10 +12,12 @@ export struct ToolRow {
 component ActionButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
+    in property <bool> enabled: true;
     callback clicked;
     height: 38px;
     border-radius: 8px;
-    background: primary ? #ed8b3a : touch.has-hover ? #263f56 : #1d3348;
+    opacity: enabled ? 1 : 0.45;
+    background: !enabled ? #172a3b : touch.pressed ? (primary ? #cf722b : #14283a) : primary ? #ed8b3a : touch.has-hover ? #263f56 : #1d3348;
     border-width: primary ? 0px : 1px;
     border-color: #38556b;
     Text {
@@ -26,7 +28,27 @@ component ActionButton inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    touch := TouchArea { clicked => { root.clicked(); } }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+
+component RefreshButton inherits Rectangle {
+    in property <bool> busy: false;
+    callback clicked;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: busy ? #172a3b : touch.pressed ? #cf722b : touch.has-hover ? #263f56 : #1d3348;
+    border-width: 1px;
+    border-color: #38556b;
+    Text {
+        text: root.busy ? "..." : "↻";
+        color: root.busy ? #7894a5 : #e6edf2;
+        font-size: root.busy ? 10px : 18px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea { enabled: !root.busy; clicked => { root.clicked(); } }
 }
 
 export component AppWindow inherits Window {
@@ -45,6 +67,7 @@ export component AppWindow inherits Window {
     in property <string> log-text;
     in property <string> summary;
     in property <string> config-path;
+    in property <bool> memory-refreshing: false;
 
     callback start-tool(int);
     callback stop-tool(int);
@@ -53,16 +76,13 @@ export component AppWindow inherits Window {
     callback stop-all;
     callback restart-all;
     callback refresh-memory;
-    callback open-config;
     callback open-log-file(int);
     callback open-workdir(int);
     callback hide-requested;
     callback exit-requested;
 
     Rectangle {
-        background: @linear-gradient(145deg, #0b1d2c 0%, #102b3f 62%, #173b4c 100%);
-        Rectangle { x: parent.width - 350px; y: -110px; width: 500px; height: 260px; border-radius: 130px; background: #183f5055; }
-        Rectangle { x: -120px; y: parent.height - 150px; width: 420px; height: 240px; border-radius: 120px; background: #ed8b3a0c; }
+        background: #0d2132;
 
         VerticalLayout {
             padding: 26px;
@@ -90,7 +110,7 @@ export component AppWindow inherits Window {
 
                 Rectangle {
                     width: 56%;
-                    background: #10283aee;
+                    background: #10283a;
                     border-width: 1px;
                     border-color: #29465a;
                     border-radius: 12px;
@@ -101,7 +121,12 @@ export component AppWindow inherits Window {
                             height: 30px;
                             Text { text: root.chinese ? "工具" : "TOOL"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; }
                             Text { text: root.chinese ? "状态" : "STATUS"; color: #7894a5; font-size: 11px; font-weight: 700; width: 96px; }
-                            Text { text: root.chinese ? "内存" : "MEMORY"; color: #7894a5; font-size: 11px; font-weight: 700; width: 104px; }
+                            HorizontalLayout {
+                                width: 104px;
+                                spacing: 5px;
+                                Text { text: root.chinese ? "内存" : "MEMORY"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                RefreshButton { busy: root.memory-refreshing; clicked => { root.refresh-memory(); } }
+                            }
                         }
                         ScrollView {
                             vertical-stretch: 1;
@@ -136,7 +161,7 @@ export component AppWindow inherits Window {
 
                 Rectangle {
                     horizontal-stretch: 1;
-                    background: #091b29ee;
+                    background: #091b29;
                     border-width: 1px;
                     border-color: #29465a;
                     border-radius: 12px;
@@ -149,17 +174,13 @@ export component AppWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Text { text: root.selected-index >= 0 ? root.chinese ? "已缓存" : "BUFFERED" : root.chinese ? "空闲" : "IDLE"; color: #6f8b9c; font-size: 10px; }
                         }
-                        ScrollView {
+                        TextEdit {
                             vertical-stretch: 1;
-                            Text {
-                                width: parent.width;
-                                text: root.log-text;
-                                color: #b9c9d2;
-                                font-family: "Consolas";
-                                font-size: 11px;
-                                wrap: word-wrap;
-                                vertical-alignment: bottom;
-                            }
+                            text: root.log-text;
+                            read-only: true;
+                            font-family: "Consolas";
+                            font-size: 11px;
+                            wrap: word-wrap;
                         }
                         HorizontalLayout {
                             height: 34px;
@@ -182,8 +203,6 @@ export component AppWindow inherits Window {
                 ActionButton { width: 94px; label: root.chinese ? "全部停止" : "Stop all"; clicked => { root.stop-all(); } }
                 ActionButton { width: 104px; label: root.chinese ? "全部重启" : "Restart all"; clicked => { root.restart-all(); } }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                ActionButton { width: 104px; label: root.chinese ? "内存" : "Memory"; clicked => { root.refresh-memory(); } }
-                ActionButton { width: 104px; label: root.chinese ? "设置" : "Settings"; clicked => { root.open-config(); } }
                 ActionButton { width: 72px; label: root.chinese ? "隐藏" : "Hide"; clicked => { root.hide-requested(); } }
                 ActionButton { width: 66px; label: root.chinese ? "退出" : "Exit"; clicked => { root.exit-requested(); } }
             }
@@ -213,7 +232,7 @@ export component KeeperTray inherits SystemTrayIcon {
         MenuItem { title: root.chinese ? "全部停止" : "Stop All"; activated => { root.stop-all(); } }
         MenuItem { title: root.chinese ? "全部重启" : "Restart All"; activated => { root.restart-all(); } }
         MenuSeparator {}
-        MenuItem { title: root.chinese ? "设置" : "Settings"; activated => { root.open-config(); } }
+        MenuItem { title: root.chinese ? "打开配置文件" : "Open Config File"; activated => { root.open-config(); } }
         MenuItem { title: root.chinese ? "退出 WinKeeper" : "Exit WinKeeper"; activated => { root.exit-requested(); } }
     }
 }
