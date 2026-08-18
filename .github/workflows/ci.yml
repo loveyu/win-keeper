@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -41,12 +43,17 @@ jobs:
             target: x86_64-unknown-linux-gnu
             package: linux-x86_64
             binary: win-keeper
+            linux: true
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             package: linux-aarch64
             binary: win-keeper
+            linux: true
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: matrix.linux
+        run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -60,4 +67,3 @@ jobs:
           name: ${{ matrix.package }}-ci
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
-
