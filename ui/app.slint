@@ -1,0 +1,216 @@
+import { Button, ScrollView } from "std-widgets.slint";
+
+export struct ToolRow {
+    name: string,
+    status: string,
+    memory: string,
+    accent: color,
+    pid: int,
+    manager: bool,
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    callback clicked;
+    height: 38px;
+    border-radius: 8px;
+    background: primary ? #ed8b3a : touch.has-hover ? #263f56 : #1d3348;
+    border-width: primary ? 0px : 1px;
+    border-color: #38556b;
+    Text {
+        text: root.label;
+        color: primary ? #102638 : #e6edf2;
+        font-family: "Trebuchet MS";
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+export component AppWindow inherits Window {
+    title: "WinKeeper — Process Console";
+    preferred-width: 1120px;
+    preferred-height: 720px;
+    min-width: 880px;
+    min-height: 560px;
+    background: #0d2132;
+    default-font-family: "Trebuchet MS";
+
+    in property <[ToolRow]> tools;
+    in-out property <int> selected-index: -1;
+    in property <string> log-text;
+    in property <string> summary;
+    in property <string> config-path;
+
+    callback start-tool(int);
+    callback stop-tool(int);
+    callback restart-tool(int);
+    callback start-all;
+    callback stop-all;
+    callback restart-all;
+    callback refresh-memory;
+    callback open-config;
+    callback open-log-file(int);
+    callback open-workdir(int);
+    callback hide-requested;
+    callback exit-requested;
+
+    Rectangle {
+        background: @linear-gradient(145deg, #0b1d2c 0%, #102b3f 62%, #173b4c 100%);
+        Rectangle { x: parent.width - 350px; y: -110px; width: 500px; height: 260px; border-radius: 130px; background: #183f5055; }
+        Rectangle { x: -120px; y: parent.height - 150px; width: 420px; height: 240px; border-radius: 120px; background: #ed8b3a0c; }
+
+        VerticalLayout {
+            padding: 26px;
+            spacing: 18px;
+
+            HorizontalLayout {
+                height: 68px;
+                spacing: 16px;
+                VerticalLayout {
+                    spacing: 2px;
+                    Text { text: "WINKEEPER"; color: #ed8b3a; font-size: 13px; font-weight: 800; letter-spacing: 2px; }
+                    Text { text: "Process Console"; color: #f1f4f5; font-size: 29px; font-weight: 700; }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: root.summary; color: #a9bcc8; font-size: 13px; horizontal-alignment: right; }
+                    Text { text: root.config-path; color: #6f8b9c; font-size: 11px; horizontal-alignment: right; overflow: elide; }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 16px;
+                vertical-stretch: 1;
+
+                Rectangle {
+                    width: 56%;
+                    background: #10283aee;
+                    border-width: 1px;
+                    border-color: #29465a;
+                    border-radius: 12px;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            height: 30px;
+                            Text { text: "TOOL"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; }
+                            Text { text: "STATUS"; color: #7894a5; font-size: 11px; font-weight: 700; width: 96px; }
+                            Text { text: "MEMORY"; color: #7894a5; font-size: 11px; font-weight: 700; width: 104px; }
+                        }
+                        ScrollView {
+                            vertical-stretch: 1;
+                            VerticalLayout {
+                                spacing: 6px;
+                                for row[i] in root.tools : Rectangle {
+                                    height: 54px;
+                                    border-radius: 8px;
+                                    background: root.selected-index == i ? #24465c : row-touch.has-hover ? #19374b : #142e41;
+                                    border-width: root.selected-index == i ? 1px : 0px;
+                                    border-color: row.accent;
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 10px;
+                                        spacing: 10px;
+                                        Rectangle { width: 5px; height: 28px; border-radius: 3px; background: row.accent; }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Text { text: row.name; color: #edf2f4; font-size: 14px; font-weight: 600; overflow: elide; }
+                                            Text { text: row.pid > 0 ? "PID " + row.pid : "No active process"; color: #718c9d; font-size: 10px; }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                                        Text { text: row.status; color: row.accent; font-size: 12px; font-weight: 700; width: 96px; vertical-alignment: center; }
+                                        Text { text: row.memory; color: #c4d0d7; font-size: 12px; width: 104px; vertical-alignment: center; }
+                                    }
+                                    row-touch := TouchArea { clicked => { root.selected-index = i; } }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: #091b29ee;
+                    border-width: 1px;
+                    border-color: #29465a;
+                    border-radius: 12px;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+                        HorizontalLayout {
+                            height: 30px;
+                            Text { text: "LIVE OUTPUT"; color: #ed8b3a; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text { text: root.selected-index >= 0 ? "BUFFERED" : "IDLE"; color: #6f8b9c; font-size: 10px; }
+                        }
+                        ScrollView {
+                            vertical-stretch: 1;
+                            Text {
+                                width: parent.width;
+                                text: root.log-text;
+                                color: #b9c9d2;
+                                font-family: "Consolas";
+                                font-size: 11px;
+                                wrap: word-wrap;
+                                vertical-alignment: bottom;
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 34px;
+                            spacing: 8px;
+                            ActionButton { label: "Open log"; clicked => { root.open-log-file(root.selected-index); } }
+                            ActionButton { label: "Work dir"; clicked => { root.open-workdir(root.selected-index); } }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                height: 40px;
+                spacing: 9px;
+                ActionButton { width: 82px; label: "Start"; primary: true; clicked => { root.start-tool(root.selected-index); } }
+                ActionButton { width: 82px; label: "Stop"; clicked => { root.stop-tool(root.selected-index); } }
+                ActionButton { width: 90px; label: "Restart"; clicked => { root.restart-tool(root.selected-index); } }
+                Rectangle { width: 1px; height: 28px; background: #365065; }
+                ActionButton { width: 94px; label: "Start all"; clicked => { root.start-all(); } }
+                ActionButton { width: 94px; label: "Stop all"; clicked => { root.stop-all(); } }
+                ActionButton { width: 104px; label: "Restart all"; clicked => { root.restart-all(); } }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                ActionButton { width: 104px; label: "Memory"; clicked => { root.refresh-memory(); } }
+                ActionButton { width: 104px; label: "Settings"; clicked => { root.open-config(); } }
+                ActionButton { width: 72px; label: "Hide"; clicked => { root.hide-requested(); } }
+                ActionButton { width: 66px; label: "Exit"; clicked => { root.exit-requested(); } }
+            }
+        }
+    }
+}
+
+export component KeeperTray inherits SystemTrayIcon {
+    icon: @image-url("tray-icon.svg");
+    title: "WinKeeper";
+    tooltip: "WinKeeper process supervisor";
+    visible: true;
+
+    callback open-manager;
+    callback start-all;
+    callback stop-all;
+    callback restart-all;
+    callback open-config;
+    callback exit-requested;
+
+    clicked => { root.open-manager(); }
+    Menu {
+        MenuItem { title: "Open Manager"; activated => { root.open-manager(); } }
+        MenuSeparator {}
+        MenuItem { title: "Start All"; activated => { root.start-all(); } }
+        MenuItem { title: "Stop All"; activated => { root.stop-all(); } }
+        MenuItem { title: "Restart All"; activated => { root.restart-all(); } }
+        MenuSeparator {}
+        MenuItem { title: "Settings"; activated => { root.open-config(); } }
+        MenuItem { title: "Exit WinKeeper"; activated => { root.exit-requested(); } }
+    }
+}

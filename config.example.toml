@@ -1,0 +1,22 @@
+[manager]
+start_with_system = true
+minimize_to_tray = true
+log_buffer_lines = 10000
+stop_timeout_ms = 5000
+
+[[tools]]
+name = "example-worker"
+command = "C:\\Tools\\example-worker.exe"
+args = ["--config", "config.toml"]
+workdir = "C:\\Tools"
+admin = false
+auto_start = true
+auto_restart = true
+restart_delay_ms = 3000
+max_restart_count = 5
+restart_window_seconds = 60
+
+# Linux uses the same fields. Replace command/workdir with Linux paths:
+# command = "/opt/example/bin/example-worker"
+# workdir = "/opt/example"
+
