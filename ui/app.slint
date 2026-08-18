@@ -30,7 +30,9 @@ component ActionButton inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    title: "WinKeeper — Process Console";
+    in property <bool> chinese: false;
+    title: chinese ? "WinKeeper — 进程控制台" : "WinKeeper — Process Console";
+    icon: @image-url("tray-icon.png");
     preferred-width: 1120px;
     preferred-height: 720px;
     min-width: 880px;
@@ -72,7 +74,7 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     spacing: 2px;
                     Text { text: "WINKEEPER"; color: #ed8b3a; font-size: 13px; font-weight: 800; letter-spacing: 2px; }
-                    Text { text: "Process Console"; color: #f1f4f5; font-size: 29px; font-weight: 700; }
+                    Text { text: root.chinese ? "进程控制台" : "Process Console"; color: #f1f4f5; font-size: 29px; font-weight: 700; }
                 }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 VerticalLayout {
@@ -97,9 +99,9 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         HorizontalLayout {
                             height: 30px;
-                            Text { text: "TOOL"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; }
-                            Text { text: "STATUS"; color: #7894a5; font-size: 11px; font-weight: 700; width: 96px; }
-                            Text { text: "MEMORY"; color: #7894a5; font-size: 11px; font-weight: 700; width: 104px; }
+                            Text { text: root.chinese ? "工具" : "TOOL"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; }
+                            Text { text: root.chinese ? "状态" : "STATUS"; color: #7894a5; font-size: 11px; font-weight: 700; width: 96px; }
+                            Text { text: root.chinese ? "内存" : "MEMORY"; color: #7894a5; font-size: 11px; font-weight: 700; width: 104px; }
                         }
                         ScrollView {
                             vertical-stretch: 1;
@@ -119,7 +121,7 @@ export component AppWindow inherits Window {
                                         VerticalLayout {
                                             alignment: center;
                                             Text { text: row.name; color: #edf2f4; font-size: 14px; font-weight: 600; overflow: elide; }
-                                            Text { text: row.pid > 0 ? "PID " + row.pid : "No active process"; color: #718c9d; font-size: 10px; }
+                                            Text { text: row.pid > 0 ? "PID " + row.pid : root.chinese ? "无活动进程" : "No active process"; color: #718c9d; font-size: 10px; }
                                         }
                                         Rectangle { horizontal-stretch: 1; background: transparent; }
                                         Text { text: row.status; color: row.accent; font-size: 12px; font-weight: 700; width: 96px; vertical-alignment: center; }
@@ -143,9 +145,9 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         HorizontalLayout {
                             height: 30px;
-                            Text { text: "LIVE OUTPUT"; color: #ed8b3a; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
+                            Text { text: root.chinese ? "实时输出" : "LIVE OUTPUT"; color: #ed8b3a; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
-                            Text { text: root.selected-index >= 0 ? "BUFFERED" : "IDLE"; color: #6f8b9c; font-size: 10px; }
+                            Text { text: root.selected-index >= 0 ? root.chinese ? "已缓存" : "BUFFERED" : root.chinese ? "空闲" : "IDLE"; color: #6f8b9c; font-size: 10px; }
                         }
                         ScrollView {
                             vertical-stretch: 1;
@@ -162,8 +164,8 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 34px;
                             spacing: 8px;
-                            ActionButton { label: "Open log"; clicked => { root.open-log-file(root.selected-index); } }
-                            ActionButton { label: "Work dir"; clicked => { root.open-workdir(root.selected-index); } }
+                            ActionButton { label: root.chinese ? "打开日志" : "Open log"; clicked => { root.open-log-file(root.selected-index); } }
+                            ActionButton { label: root.chinese ? "工作目录" : "Work dir"; clicked => { root.open-workdir(root.selected-index); } }
                         }
                     }
                 }
@@ -172,27 +174,28 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 height: 40px;
                 spacing: 9px;
-                ActionButton { width: 82px; label: "Start"; primary: true; clicked => { root.start-tool(root.selected-index); } }
-                ActionButton { width: 82px; label: "Stop"; clicked => { root.stop-tool(root.selected-index); } }
-                ActionButton { width: 90px; label: "Restart"; clicked => { root.restart-tool(root.selected-index); } }
+                ActionButton { width: 82px; label: root.chinese ? "启动" : "Start"; primary: true; clicked => { root.start-tool(root.selected-index); } }
+                ActionButton { width: 82px; label: root.chinese ? "停止" : "Stop"; clicked => { root.stop-tool(root.selected-index); } }
+                ActionButton { width: 90px; label: root.chinese ? "重启" : "Restart"; clicked => { root.restart-tool(root.selected-index); } }
                 Rectangle { width: 1px; height: 28px; background: #365065; }
-                ActionButton { width: 94px; label: "Start all"; clicked => { root.start-all(); } }
-                ActionButton { width: 94px; label: "Stop all"; clicked => { root.stop-all(); } }
-                ActionButton { width: 104px; label: "Restart all"; clicked => { root.restart-all(); } }
+                ActionButton { width: 94px; label: root.chinese ? "全部启动" : "Start all"; clicked => { root.start-all(); } }
+                ActionButton { width: 94px; label: root.chinese ? "全部停止" : "Stop all"; clicked => { root.stop-all(); } }
+                ActionButton { width: 104px; label: root.chinese ? "全部重启" : "Restart all"; clicked => { root.restart-all(); } }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                ActionButton { width: 104px; label: "Memory"; clicked => { root.refresh-memory(); } }
-                ActionButton { width: 104px; label: "Settings"; clicked => { root.open-config(); } }
-                ActionButton { width: 72px; label: "Hide"; clicked => { root.hide-requested(); } }
-                ActionButton { width: 66px; label: "Exit"; clicked => { root.exit-requested(); } }
+                ActionButton { width: 104px; label: root.chinese ? "内存" : "Memory"; clicked => { root.refresh-memory(); } }
+                ActionButton { width: 104px; label: root.chinese ? "设置" : "Settings"; clicked => { root.open-config(); } }
+                ActionButton { width: 72px; label: root.chinese ? "隐藏" : "Hide"; clicked => { root.hide-requested(); } }
+                ActionButton { width: 66px; label: root.chinese ? "退出" : "Exit"; clicked => { root.exit-requested(); } }
             }
         }
     }
 }
 
 export component KeeperTray inherits SystemTrayIcon {
-    icon: @image-url("tray-icon.svg");
+    in property <bool> chinese: false;
+    icon: @image-url("tray-icon.png");
     title: "WinKeeper";
-    tooltip: "WinKeeper process supervisor";
+    tooltip: chinese ? "WinKeeper 进程守护工具" : "WinKeeper process supervisor";
     visible: true;
 
     callback open-manager;
@@ -204,13 +207,13 @@ export component KeeperTray inherits SystemTrayIcon {
 
     clicked => { root.open-manager(); }
     Menu {
-        MenuItem { title: "Open Manager"; activated => { root.open-manager(); } }
+        MenuItem { title: root.chinese ? "打开管理器" : "Open Manager"; activated => { root.open-manager(); } }
         MenuSeparator {}
-        MenuItem { title: "Start All"; activated => { root.start-all(); } }
-        MenuItem { title: "Stop All"; activated => { root.stop-all(); } }
-        MenuItem { title: "Restart All"; activated => { root.restart-all(); } }
+        MenuItem { title: root.chinese ? "全部启动" : "Start All"; activated => { root.start-all(); } }
+        MenuItem { title: root.chinese ? "全部停止" : "Stop All"; activated => { root.stop-all(); } }
+        MenuItem { title: root.chinese ? "全部重启" : "Restart All"; activated => { root.restart-all(); } }
         MenuSeparator {}
-        MenuItem { title: "Settings"; activated => { root.open-config(); } }
-        MenuItem { title: "Exit WinKeeper"; activated => { root.exit-requested(); } }
+        MenuItem { title: root.chinese ? "设置" : "Settings"; activated => { root.open-config(); } }
+        MenuItem { title: root.chinese ? "退出 WinKeeper" : "Exit WinKeeper"; activated => { root.exit-requested(); } }
     }
 }

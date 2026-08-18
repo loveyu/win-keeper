@@ -10,8 +10,13 @@ use std::{path::PathBuf, sync::Arc};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("WinKeeper startup failed: {error:#}");
-        platform::show_error("WinKeeper", &format!("Startup failed:\n{error:#}"));
+        let message = if ui::is_chinese_locale() {
+            format!("WinKeeper 启动失败：{error:#}")
+        } else {
+            format!("WinKeeper startup failed: {error:#}")
+        };
+        eprintln!("{message}");
+        platform::show_error("WinKeeper", &message);
     }
 }
 
@@ -22,7 +27,11 @@ fn run() -> Result<()> {
         .with_context(|| format!("failed to load {}", paths.config_file.display()))?;
 
     if check_only {
-        println!("configuration is valid: {}", paths.config_file.display());
+        if ui::is_chinese_locale() {
+            println!("配置有效：{}", paths.config_file.display());
+        } else {
+            println!("configuration is valid: {}", paths.config_file.display());
+        }
         return Ok(());
     }
 

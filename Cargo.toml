@@ -1,6 +1,6 @@
 [package]
 name = "win-keeper"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A lightweight cross-platform desktop process supervisor"
 license = "Apache-2.0"
@@ -26,6 +26,7 @@ nix = { version = "0.31", features = ["signal", "process"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",
@@ -37,6 +38,7 @@ windows-sys = { version = "0.61", features = [
 
 [build-dependencies]
 slint-build = "1.17.1"
+winres = "0.1"
 
 [profile.release]
 codegen-units = 1
