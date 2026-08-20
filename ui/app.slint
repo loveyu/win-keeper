@@ -8,6 +8,7 @@ export struct ToolRow {
     pid: int,
     restart-count: int,
     manager: bool,
+    state: int,
 }
 
 component ActionButton inherits Rectangle {
@@ -17,13 +18,12 @@ component ActionButton inherits Rectangle {
     callback clicked;
     height: 38px;
     border-radius: 8px;
-    opacity: enabled ? 1 : 0.45;
     background: !enabled ? #172a3b : touch.pressed ? (primary ? #cf722b : #14283a) : primary ? #ed8b3a : touch.has-hover ? #263f56 : #1d3348;
     border-width: primary ? 0px : 1px;
-    border-color: #38556b;
+    border-color: enabled ? #38556b : #2b4354;
     Text {
         text: root.label;
-        color: primary ? #102638 : #e6edf2;
+        color: !root.enabled ? #718c9d : primary ? #102638 : #e6edf2;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -53,22 +53,23 @@ component RefreshButton inherits Rectangle {
 
 component InspectButton inherits Rectangle {
     in property <string> label;
+    in property <bool> enabled: true;
     callback clicked;
     width: 44px;
     height: 28px;
     border-radius: 7px;
-    background: touch.pressed ? #cf722b : touch.has-hover ? #31526b : #1d3b52;
+    background: !enabled ? #172a3b : touch.pressed ? #cf722b : touch.has-hover ? #31526b : #1d3b52;
     border-width: 1px;
-    border-color: #42647b;
+    border-color: enabled ? #42647b : #2b4354;
     Text {
         text: root.label;
-        color: #dce7ec;
+        color: root.enabled ? #dce7ec : #718c9d;
         font-size: 10px;
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    touch := TouchArea { clicked => { root.clicked(); } }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
 }
 
 export component AppWindow inherits Window {
@@ -88,9 +89,13 @@ export component AppWindow inherits Window {
     in-out property <int> selected-index: -1;
     in property <string> log-text;
     in property <string> output-timing;
+    in property <string> app-version;
     in property <string> summary;
     in property <string> config-path;
     in property <bool> memory-refreshing: false;
+    in property <bool> can-start-all: false;
+    in property <bool> can-stop-all: false;
+    in property <bool> can-restart-all: false;
     in-out property <bool> process-tree-visible: false;
     in-out property <bool> process-tree-loading: false;
     in property <string> process-tree-title;
@@ -103,12 +108,20 @@ export component AppWindow inherits Window {
     callback stop-all;
     callback restart-all;
     callback refresh-memory;
+    callback select-tool(int);
     callback open-log-file(int);
     callback open-workdir(int);
     callback inspect-process(int);
     callback open-config;
     callback hide-requested;
     callback exit-requested;
+
+    private property <bool> valid-selection: root.selected-index >= 0 && root.selected-index < root.tools.length;
+    private property <bool> selected-manager: root.valid-selection && root.tools[root.selected-index].manager;
+    private property <int> selected-state: root.valid-selection ? root.tools[root.selected-index].state : -1;
+    private property <bool> can-start-selected: root.valid-selection && !root.selected-manager && (root.selected-state == 0 || root.selected-state == 5);
+    private property <bool> can-stop-selected: root.valid-selection && !root.selected-manager && (root.selected-state == 1 || root.selected-state == 2 || root.selected-state == 4);
+    private property <bool> can-restart-selected: root.valid-selection && !root.selected-manager && root.selected-state == 2;
 
     Rectangle {
         background: #0d2132;
@@ -122,7 +135,13 @@ export component AppWindow inherits Window {
                 spacing: 16px;
                 VerticalLayout {
                     spacing: 2px;
-                    Text { text: "WINKEEPER"; color: #ed8b3a; font-size: 13px; font-weight: 800; letter-spacing: 2px; }
+                    HorizontalLayout {
+                        height: 18px;
+                        spacing: 8px;
+                        Text { text: "WINKEEPER"; color: #ed8b3a; font-size: 13px; font-weight: 800; letter-spacing: 2px; vertical-alignment: center; }
+                        Text { text: root.app-version; color: #6f8b9c; font-size: 10px; font-weight: 600; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                    }
                     Text { text: root.chinese ? "进程控制台" : "Process Console"; color: #f1f4f5; font-size: 29px; font-weight: 700; }
                 }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -185,26 +204,33 @@ export component AppWindow inherits Window {
                                     background: root.selected-index == i ? #24465c : row-touch.has-hover ? #19374b : #142e41;
                                     border-width: root.selected-index == i ? 1px : 0px;
                                     border-color: row.accent;
-                                    row-touch := TouchArea { clicked => { root.selected-index = i; } }
                                     HorizontalLayout {
                                         padding-left: 12px;
                                         padding-right: 10px;
                                         spacing: 10px;
-                                        Rectangle { width: 5px; height: 28px; border-radius: 3px; background: row.accent; }
-                                        VerticalLayout {
-                                            alignment: center;
-                                            Text { text: row.name; color: #edf2f4; font-size: 14px; font-weight: 600; overflow: elide; }
-                                            Text {
-                                                text: row.pid > 0
-                                                    ? "PID " + row.pid + (row.restart-count > 0 ? (root.chinese ? "  ·  重启 " : "  ·  Restarts ") + row.restart-count : "")
-                                                    : root.chinese ? "无活动进程" : "No active process";
-                                                color: #718c9d;
-                                                font-size: 10px;
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            background: transparent;
+                                            HorizontalLayout {
+                                                spacing: 10px;
+                                                Rectangle { width: 5px; height: 28px; border-radius: 3px; background: row.accent; }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Text { text: row.name; color: #edf2f4; font-size: 14px; font-weight: 600; overflow: elide; }
+                                                    Text {
+                                                        text: row.pid > 0
+                                                            ? "PID " + row.pid + (row.restart-count > 0 ? (root.chinese ? "  ·  重启 " : "  ·  Restarts ") + row.restart-count : "")
+                                                            : root.chinese ? "无活动进程" : "No active process";
+                                                        color: #718c9d;
+                                                        font-size: 10px;
+                                                    }
+                                                }
+                                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                                Text { text: row.status; color: row.accent; font-size: 12px; font-weight: 700; width: 96px; vertical-alignment: center; }
+                                                Text { text: row.memory; color: #c4d0d7; font-size: 12px; width: 104px; vertical-alignment: center; }
                                             }
+                                            row-touch := TouchArea { clicked => { root.select-tool(i); } }
                                         }
-                                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                                        Text { text: row.status; color: row.accent; font-size: 12px; font-weight: 700; width: 96px; vertical-alignment: center; }
-                                        Text { text: row.memory; color: #c4d0d7; font-size: 12px; width: 104px; vertical-alignment: center; }
                                         Rectangle {
                                             width: 48px;
                                             height: 54px;
@@ -213,8 +239,9 @@ export component AppWindow inherits Window {
                                                 x: 2px;
                                                 y: 13px;
                                                 label: root.chinese ? "进程树" : "Tree";
+                                                enabled: row.pid > 0;
                                                 clicked => {
-                                                    root.selected-index = i;
+                                                    root.select-tool(i);
                                                     root.inspect-process(i);
                                                 }
                                             }
@@ -237,7 +264,15 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         HorizontalLayout {
                             height: 30px;
-                            Text { text: root.chinese ? "实时输出" : "LIVE OUTPUT"; color: #ed8b3a; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
+                            spacing: 8px;
+                            Text {
+                                text: root.chinese ? "实时输出" : "LIVE OUTPUT";
+                                color: #ed8b3a;
+                                font-size: 11px;
+                                font-weight: 800;
+                                letter-spacing: 1px;
+                                vertical-alignment: center;
+                            }
                             Text {
                                 text: root.output-timing;
                                 color: #7894a5;
@@ -259,8 +294,8 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 34px;
                             spacing: 8px;
-                            ActionButton { label: root.chinese ? "打开日志" : "Open log"; clicked => { root.open-log-file(root.selected-index); } }
-                            ActionButton { label: root.chinese ? "工作目录" : "Work dir"; clicked => { root.open-workdir(root.selected-index); } }
+                            ActionButton { label: root.chinese ? "打开日志" : "Open log"; enabled: root.valid-selection; clicked => { root.open-log-file(root.selected-index); } }
+                            ActionButton { label: root.chinese ? "工作目录" : "Work dir"; enabled: root.valid-selection; clicked => { root.open-workdir(root.selected-index); } }
                         }
                     }
                 }
@@ -269,13 +304,13 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 height: 40px;
                 spacing: 9px;
-                ActionButton { width: 82px; label: root.chinese ? "启动" : "Start"; primary: true; clicked => { root.start-tool(root.selected-index); } }
-                ActionButton { width: 82px; label: root.chinese ? "停止" : "Stop"; clicked => { root.stop-tool(root.selected-index); } }
-                ActionButton { width: 90px; label: root.chinese ? "重启" : "Restart"; clicked => { root.restart-tool(root.selected-index); } }
+                ActionButton { width: 82px; label: root.chinese ? "启动" : "Start"; primary: true; enabled: root.can-start-selected; clicked => { root.start-tool(root.selected-index); } }
+                ActionButton { width: 82px; label: root.chinese ? "停止" : "Stop"; enabled: root.can-stop-selected; clicked => { root.stop-tool(root.selected-index); } }
+                ActionButton { width: 90px; label: root.chinese ? "重启" : "Restart"; enabled: root.can-restart-selected; clicked => { root.restart-tool(root.selected-index); } }
                 Rectangle { width: 1px; height: 28px; background: #365065; }
-                ActionButton { width: 94px; label: root.chinese ? "全部启动" : "Start all"; clicked => { root.start-all(); } }
-                ActionButton { width: 94px; label: root.chinese ? "全部停止" : "Stop all"; clicked => { root.stop-all(); } }
-                ActionButton { width: 104px; label: root.chinese ? "全部重启" : "Restart all"; clicked => { root.restart-all(); } }
+                ActionButton { width: 94px; label: root.chinese ? "全部启动" : "Start all"; enabled: root.can-start-all; clicked => { root.start-all(); } }
+                ActionButton { width: 94px; label: root.chinese ? "全部停止" : "Stop all"; enabled: root.can-stop-all; clicked => { root.stop-all(); } }
+                ActionButton { width: 104px; label: root.chinese ? "全部重启" : "Restart all"; enabled: root.can-restart-all; clicked => { root.restart-all(); } }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 ActionButton { width: 72px; label: root.chinese ? "隐藏" : "Hide"; clicked => { root.hide-requested(); } }
                 ActionButton { width: 66px; label: root.chinese ? "退出" : "Exit"; clicked => { root.exit-requested(); } }

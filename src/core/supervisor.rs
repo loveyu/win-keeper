@@ -83,6 +83,8 @@ pub struct Supervisor {
     platform: Arc<dyn PlatformAdapter>,
     tools: Vec<ToolHandle>,
     manager_memory: Arc<Mutex<MemoryValue>>,
+    manager_log: Arc<ToolLog>,
+    manager_started_at_unix_ms: u64,
 }
 
 struct ManagedProcess {
@@ -97,6 +99,24 @@ impl Supervisor {
         platform: Arc<dyn PlatformAdapter>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&paths.state_directory)?;
+        let manager_memory = Arc::new(Mutex::new(MemoryValue::Idle));
+        schedule_initial_manager_memory_refresh(manager_memory.clone(), platform.clone());
+        let manager_started_at_unix_ms = unix_ms();
+        let manager_log = Arc::new(ToolLog::new(
+            &paths.log_directory,
+            "win-keeper-manager",
+            config.manager.log_buffer_lines,
+        )?);
+        manager_log.write(
+            "manager",
+            &format!(
+                "WinKeeper {} started, pid={}, config={}, tools={}",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                paths.config_file.display(),
+                config.tools.len()
+            ),
+        );
         let mut tools = Vec::with_capacity(config.tools.len());
         for tool in &config.tools {
             let runtime = Arc::new(Mutex::new(Runtime {
@@ -159,7 +179,9 @@ impl Supervisor {
             paths,
             platform,
             tools,
-            manager_memory: Arc::new(Mutex::new(MemoryValue::Idle)),
+            manager_memory,
+            manager_log,
+            manager_started_at_unix_ms,
         })
     }
 
@@ -184,6 +206,10 @@ impl Supervisor {
         *self.manager_memory.lock().unwrap()
     }
 
+    pub fn manager_started_at_unix_ms(&self) -> u64 {
+        self.manager_started_at_unix_ms
+    }
+
     pub fn process_tree(&self, index: usize) -> Result<(String, Vec<ProcessInfo>)> {
         let (name, pid) = if let Some(tool) = self.tools.get(index) {
             (tool.config.name.clone(), tool.runtime.lock().unwrap().pid)
@@ -203,31 +229,39 @@ impl Supervisor {
         self.tools.len()
     }
     pub fn start(&self, index: usize) {
+        self.log_tool_request(index, "start");
         self.send(index, Control::Start);
     }
     pub fn stop(&self, index: usize) {
+        self.log_tool_request(index, "stop");
         self.send(index, Control::Stop);
     }
     pub fn restart(&self, index: usize) {
+        self.log_tool_request(index, "restart");
         self.send(index, Control::Restart);
     }
     pub fn start_all(&self) {
+        self.manager_log.write("ui", "start all requested");
         for tool in &self.tools {
             let _ = tool.control.send(Control::Start);
         }
     }
     pub fn stop_all(&self) {
+        self.manager_log.write("ui", "stop all requested");
         for tool in &self.tools {
             let _ = tool.control.send(Control::Stop);
         }
     }
     pub fn restart_all(&self) {
+        self.manager_log.write("ui", "restart all requested");
         for tool in &self.tools {
             let _ = tool.control.send(Control::Restart);
         }
     }
 
     pub fn shutdown(&self) {
+        self.manager_log
+            .write("manager", "WinKeeper is shutting down");
         for tool in &self.tools {
             let _ = tool.control.send(Control::Shutdown);
         }
@@ -239,36 +273,50 @@ impl Supervisor {
     }
 
     pub fn log_snapshot(&self, index: usize) -> String {
-        self.tools
-            .get(index)
-            .map(|tool| {
-                if tool.external_log {
-                    tool.log.snapshot_external()
-                } else {
-                    tool.log.snapshot()
-                }
-            })
-            .unwrap_or_default()
+        if let Some(tool) = self.tools.get(index) {
+            if tool.external_log {
+                tool.log.snapshot_external()
+            } else {
+                tool.log.snapshot()
+            }
+        } else if index == self.tools.len() {
+            self.manager_log.snapshot()
+        } else {
+            String::new()
+        }
     }
 
     pub fn open_log(&self, index: usize) -> Result<()> {
-        let tool = self.tools.get(index).context("invalid tool index")?;
-        self.platform.open_path(tool.log.path())
+        if let Some(tool) = self.tools.get(index) {
+            self.platform.open_path(tool.log.path())
+        } else if index == self.tools.len() {
+            self.platform.open_path(self.manager_log.path())
+        } else {
+            anyhow::bail!("invalid tool index")
+        }
     }
 
     pub fn open_workdir(&self, index: usize) -> Result<()> {
-        let tool = self.tools.get(index).context("invalid tool index")?;
-        let path = tool
-            .config
-            .workdir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(&tool.config.command)
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .to_path_buf()
-            });
+        let path = if let Some(tool) = self.tools.get(index) {
+            tool.config
+                .workdir
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    Path::new(&tool.config.command)
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .to_path_buf()
+                })
+        } else if index == self.tools.len() {
+            std::env::current_exe()
+                .context("failed to resolve WinKeeper executable path")?
+                .parent()
+                .context("WinKeeper executable has no parent directory")?
+                .to_path_buf()
+        } else {
+            anyhow::bail!("invalid tool index")
+        };
         self.platform.open_path(&path)
     }
 
@@ -350,6 +398,15 @@ impl Supervisor {
             let _ = tool.control.send(control);
         }
     }
+
+    fn log_tool_request(&self, index: usize, action: &str) {
+        if let Some(tool) = self.tools.get(index) {
+            self.manager_log.write(
+                "ui",
+                &format!("{action} requested for {}", tool.config.name),
+            );
+        }
+    }
 }
 
 fn spawn_worker(
@@ -382,6 +439,7 @@ fn worker_loop(
         None
     };
     let mut restarts = VecDeque::new();
+    let mut has_started_once = false;
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(200)) {
@@ -465,7 +523,21 @@ fn worker_loop(
         {
             next_start = None;
             match start_process(&config, &runtime, &log, platform.as_ref()) {
-                Ok(started) => process = Some(started),
+                Ok(started) => {
+                    let delays = if has_started_once {
+                        vec![Duration::from_secs(5)]
+                    } else {
+                        vec![Duration::from_secs(5), Duration::from_secs(10)]
+                    };
+                    schedule_tool_memory_refresh(
+                        started.child.id(),
+                        runtime.clone(),
+                        platform.clone(),
+                        delays,
+                    );
+                    has_started_once = true;
+                    process = Some(started);
+                }
                 Err(error) => {
                     log.write("manager", &format!("failed to start: {error:#}"));
                     let mut state = runtime.lock().unwrap();
@@ -706,4 +778,56 @@ fn unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn schedule_initial_manager_memory_refresh(
+    manager_memory: Arc<Mutex<MemoryValue>>,
+    platform: Arc<dyn PlatformAdapter>,
+) {
+    let _ = thread::Builder::new()
+        .name("manager-initial-memory".into())
+        .spawn(move || {
+            let started = Instant::now();
+            for delay in [Duration::from_secs(5), Duration::from_secs(10)] {
+                thread::sleep((started + delay).saturating_duration_since(Instant::now()));
+                *manager_memory.lock().unwrap() = MemoryValue::Pending;
+                let value = platform
+                    .process_tree_memory_usage(std::process::id())
+                    .map(MemoryValue::Bytes)
+                    .unwrap_or(MemoryValue::Unavailable);
+                *manager_memory.lock().unwrap() = value;
+            }
+        });
+}
+
+fn schedule_tool_memory_refresh(
+    pid: u32,
+    runtime: Arc<Mutex<Runtime>>,
+    platform: Arc<dyn PlatformAdapter>,
+    delays: Vec<Duration>,
+) {
+    let _ = thread::Builder::new()
+        .name("tool-memory-refresh".into())
+        .spawn(move || {
+            let started = Instant::now();
+            for delay in delays {
+                thread::sleep((started + delay).saturating_duration_since(Instant::now()));
+                {
+                    let mut current = runtime.lock().unwrap();
+                    if current.pid != Some(pid) {
+                        return;
+                    }
+                    current.memory = MemoryValue::Pending;
+                }
+                let value = platform
+                    .process_tree_memory_usage(pid)
+                    .map(MemoryValue::Bytes)
+                    .unwrap_or(MemoryValue::Unavailable);
+                let mut current = runtime.lock().unwrap();
+                if current.pid != Some(pid) {
+                    return;
+                }
+                current.memory = value;
+            }
+        });
 }

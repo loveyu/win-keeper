@@ -46,6 +46,7 @@ pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
         .unwrap_or_else(is_chinese_locale);
     window.set_chinese(chinese);
     tray.set_chinese(chinese);
+    window.set_app_version(format!("v{}", env!("CARGO_PKG_VERSION")).into());
     window.set_config_path(supervisor.config_path().display().to_string().into());
 
     wire_window(&window, supervisor.clone());
@@ -70,6 +71,7 @@ pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
     log_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
         if let Some(window) = weak_window.upgrade()
             && window.window().is_visible()
+            && !window.window().is_minimized()
         {
             refresh_log(&window, &log_supervisor, chinese, &mut log_cache);
         }
@@ -88,6 +90,9 @@ pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
 
     if show_window || !supervisor.minimize_to_tray() {
         show_manager(&window, &supervisor)?;
+    } else {
+        window.window().set_minimized(true);
+        window.show()?;
     }
     #[cfg(unix)]
     std::thread::Builder::new()
@@ -99,7 +104,7 @@ pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
                 });
             }
         })?;
-    // Keep tray-only startup alive even if the backend has not exposed the icon yet.
+    // Keep minimized startup alive until the user exits from the window or tray.
     let result = slint::run_event_loop_until_quit();
     supervisor.shutdown();
     drop(activation_timer);
@@ -146,6 +151,20 @@ fn wire_window(window: &AppWindow, supervisor: Arc<Supervisor>) {
             window.set_memory_refreshing(true);
         }
         action.sample_memory();
+    });
+    let select_weak = window.as_weak();
+    let action = supervisor.clone();
+    window.on_select_tool(move |index| {
+        if index < 0 {
+            return;
+        }
+        let Some(window) = select_weak.upgrade() else {
+            return;
+        };
+        window.set_selected_index(index);
+        let chinese = window.get_chinese();
+        let mut cache = LogRefreshCache::default();
+        refresh_log(&window, &action, chinese, &mut cache);
     });
     let action = supervisor.clone();
     window.on_open_log_file(move |index| {
@@ -300,7 +319,9 @@ fn wire_tray(tray: &KeeperTray, window: &AppWindow, supervisor: Arc<Supervisor>)
 
 fn show_manager(window: &AppWindow, supervisor: &Supervisor) -> Result<(), slint::PlatformError> {
     supervisor.sample_memory();
+    window.window().set_minimized(false);
     window.show()?;
+    window.window().set_minimized(false);
     window.window().request_redraw();
     Ok(())
 }
@@ -330,8 +351,26 @@ fn refresh_state(
             pid: std::process::id() as i32,
             restart_count: 0,
             manager: true,
+            state: 2,
         });
         window.set_tools(ModelRc::new(VecModel::from(rows)));
+        window.set_can_start_all(
+            snapshots
+                .iter()
+                .any(|tool| matches!(tool.state, ToolState::Stopped | ToolState::Crashed)),
+        );
+        window.set_can_stop_all(snapshots.iter().any(|tool| {
+            matches!(
+                tool.state,
+                ToolState::Starting | ToolState::Running | ToolState::Restarting
+            )
+        }));
+        window.set_can_restart_all(snapshots.iter().any(|tool| {
+            matches!(
+                tool.state,
+                ToolState::Starting | ToolState::Running | ToolState::Restarting
+            )
+        }));
         window.set_memory_refreshing(
             manager_memory == MemoryValue::Pending
                 || snapshots
@@ -372,7 +411,9 @@ fn refresh_log(
     cache: &mut LogRefreshCache,
 ) {
     let selected = window.get_selected_index();
-    let started_at = if selected >= 0 {
+    let started_at = if selected >= 0 && selected as usize == supervisor.tool_count() {
+        Some(supervisor.manager_started_at_unix_ms())
+    } else if selected >= 0 {
         supervisor
             .snapshots()
             .get(selected as usize)
@@ -392,7 +433,7 @@ fn refresh_log(
         );
         cache.selected_started_at = started_at;
     }
-    let log_text = if selected >= 0 && (selected as usize) < supervisor.tool_count() {
+    let log_text = if selected >= 0 && (selected as usize) <= supervisor.tool_count() {
         supervisor.log_snapshot(selected as usize)
     } else {
         tr(
@@ -483,6 +524,14 @@ fn row_from_snapshot(snapshot: &ToolSnapshot, chinese: bool) -> ToolRow {
         pid: snapshot.pid.unwrap_or_default() as i32,
         restart_count: snapshot.restart_count as i32,
         manager: false,
+        state: match snapshot.state {
+            ToolState::Stopped => 0,
+            ToolState::Starting => 1,
+            ToolState::Running => 2,
+            ToolState::Stopping => 3,
+            ToolState::Restarting => 4,
+            ToolState::Crashed => 5,
+        },
     }
 }
 
