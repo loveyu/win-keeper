@@ -1,6 +1,14 @@
 # WinKeeper
 
+[简体中文](README.zh-CN.md)
+
 WinKeeper is a lightweight cross-platform desktop process supervisor for managing persistent command-line tools. It provides tray management, lifecycle control, automatic restart, stdout/stderr collection, persistent logs, process-tree cleanup, and on-demand memory sampling.
+
+## Screenshot
+
+![WinKeeper process console with sample tools](docs/winkeeper-console-en.png)
+
+The screenshot is captured from the real application using representative sample processes and logs.
 
 ## Platforms
 
@@ -8,7 +16,7 @@ Release artifacts are produced for:
 
 | Platform | Architecture | Process tree | Memory source | Autostart |
 | --- | --- | --- | --- | --- |
-| Windows 10/11 | x86_64, ARM64 | Job Object | Process-tree PrivateUsage | `HKCU\\...\\Run` |
+| Windows 10/11 | x86_64, ARM64 | Job Object | Process-tree PrivateUsage | `HKCU\...\Run` |
 | Linux Desktop | x86_64, ARM64 | Process Group | Process-tree `/proc/<pid>/smaps_rollup` PSS | XDG autostart |
 
 Linux targets Debian/Ubuntu desktop environments, KDE Plasma and GNOME, on X11 or Wayland. macOS is not supported.
@@ -19,15 +27,18 @@ Linux targets Debian/Ubuntu desktop environments, KDE Plasma and GNOME, on X11 o
 - Configuration-driven direct process execution without a shell
 - Start, stop, restart, and batch actions
 - stdout and stderr capture with timestamped per-tool logs
-- In-memory live log buffer
+- Click-to-select live output with start time and uptime
+- In-memory live log buffer and a dedicated manager log
 - Automatic restart with delay and restart-window limiting
-- Windows Job Objects and Linux process groups for descendant cleanup
-- One-shot asynchronous memory sampling when the manager opens or Memory is clicked
+- Asynchronous process-tree inspection with Windows Job Objects and Linux process groups for descendant cleanup
+- Process-tree memory sampling on demand and delayed sampling after startup or restart
 - Native per-user autostart integration
 - Per-user single-instance enforcement
-- Hidden-to-tray startup and close-to-tray behavior
+- Minimized taskbar startup, tray controls, and close-to-tray behavior
+- State-aware controls that disable unavailable actions
+- Persistent elevated helper for administrator-designated tools on Windows
 
-The first-stage MVP intentionally rejects `admin = true`. Windows UAC/elevated helper and Linux Polkit integration are planned separately so WinKeeper never silently runs an administrator-designated tool without elevation.
+On Windows, `admin = true` tools are delegated to the persistent elevated helper. Linux Polkit integration is not currently provided, so Linux tools run with the WinKeeper user's privileges.
 
 ## Configuration
 
@@ -35,7 +46,7 @@ The default configuration paths are:
 
 | Platform | Configuration | Logs |
 | --- | --- | --- |
-| Windows | `%APPDATA%\\WinKeeper\\config.toml` | `%APPDATA%\\WinKeeper\\logs` |
+| Windows | `%APPDATA%\WinKeeper\config.toml` | `%APPDATA%\WinKeeper\logs` |
 | Linux | `~/.config/winkeeper/config.toml` | `~/.local/state/winkeeper/logs` |
 
 WinKeeper creates an empty valid configuration on first launch. Use [config.example.toml](config.example.toml) as a reference. The same TOML schema is used on both platforms.
@@ -71,7 +82,7 @@ After changing `config.toml`, exit and restart WinKeeper. Settings opens the act
 win-keeper [--config PATH] [--check-config] [--show] [--autostart]
 ```
 
-Normal launches open the manager immediately. System autostart entries use the internal `--autostart` flag to start WinKeeper in the tray when `minimize_to_tray` is enabled. Click the tray icon to open the manager; `--show` explicitly opens it as well.
+Normal launches open the manager immediately. System autostart entries use the internal `--autostart` flag to start WinKeeper minimized in the taskbar when `minimize_to_tray` is enabled. Restore it from the taskbar or tray icon; `--show` explicitly opens it as well.
 
 ## Build
 
