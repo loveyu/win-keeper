@@ -5,7 +5,11 @@ mod platform;
 mod ui;
 
 use anyhow::{Context, Result};
-use core::{config::AppConfig, supervisor::Supervisor};
+use core::{
+    config::{AppConfig, configured_chinese},
+    single_instance::SingleInstanceGuard,
+    supervisor::Supervisor,
+};
 use std::{path::PathBuf, sync::Arc};
 
 fn main() {
@@ -43,7 +47,13 @@ fn run() -> Result<()> {
         .with_context(|| format!("failed to load {}", paths.config_file.display()))?;
 
     if args.check_only {
-        if ui::is_chinese_locale() {
+        let chinese = config
+            .manager
+            .lang
+            .as_deref()
+            .and_then(configured_chinese)
+            .unwrap_or_else(ui::is_chinese_locale);
+        if chinese {
             println!("配置有效：{}", paths.config_file.display());
         } else {
             println!("configuration is valid: {}", paths.config_file.display());
@@ -51,10 +61,29 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    let Some(_instance_guard) = SingleInstanceGuard::try_acquire(&paths.state_directory)? else {
+        if args.show_window || !args.autostart {
+            SingleInstanceGuard::request_activation(&paths.state_directory)?;
+        }
+        let chinese = config
+            .manager
+            .lang
+            .as_deref()
+            .and_then(configured_chinese)
+            .unwrap_or_else(ui::is_chinese_locale);
+        if chinese {
+            eprintln!("WinKeeper 已在当前用户会话中运行。");
+        } else {
+            eprintln!("WinKeeper is already running for the current user.");
+        }
+        return Ok(());
+    };
+
     platform::configure_autostart(config.manager.start_with_system, &paths.config_file)?;
+    platform::prepare_shutdown_signals()?;
     let platform = platform::adapter();
     let supervisor = Arc::new(Supervisor::new(config, paths, platform)?);
-    ui::run(supervisor, args.show_window)
+    ui::run(supervisor, args.show_window || !args.autostart)
 }
 
 #[derive(Default)]
@@ -62,6 +91,7 @@ struct Args {
     config: Option<PathBuf>,
     check_only: bool,
     show_window: bool,
+    autostart: bool,
     elevated_helper: bool,
     manifest: Option<PathBuf>,
     state_directory: Option<PathBuf>,
@@ -79,6 +109,7 @@ fn parse_args() -> Result<Args> {
             }
             "--check-config" => parsed.check_only = true,
             "--show" => parsed.show_window = true,
+            "--autostart" => parsed.autostart = true,
             "--elevated-helper" => parsed.elevated_helper = true,
             "--manifest" => {
                 parsed.manifest = Some(PathBuf::from(
@@ -96,7 +127,7 @@ fn parse_args() -> Result<Args> {
             }
             "--help" | "-h" => {
                 println!(
-                    "win-keeper [--config PATH] [--check-config] [--show] [--elevated-helper --manifest PATH --state-dir PATH]"
+                    "win-keeper [--config PATH] [--check-config] [--show] [--autostart] [--elevated-helper --manifest PATH --state-dir PATH]"
                 );
                 std::process::exit(0);
             }

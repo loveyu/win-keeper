@@ -1,10 +1,27 @@
 use crate::core::config::ToolConfig;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::Arc,
 };
+
+#[derive(Clone, Debug)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub depth: usize,
+    pub name: String,
+    pub memory_bytes: Option<u64>,
+}
+
+pub(crate) struct ProcessEntry {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub name: String,
+    pub memory_bytes: Option<u64>,
+}
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -20,6 +37,7 @@ pub struct AppPaths {
 pub trait ProcessGuard: Send {
     fn attach(&mut self, child: &Child) -> Result<()>;
     fn request_graceful_stop(&self) -> Result<bool>;
+    fn is_tree_running(&self) -> Result<bool>;
     fn force_stop(&self) -> Result<()>;
 }
 
@@ -30,7 +48,69 @@ pub trait PlatformAdapter: Send + Sync {
         config: &ToolConfig,
     ) -> Result<Box<dyn ProcessGuard>>;
     fn memory_usage(&self, pid: u32) -> Result<u64>;
+    fn process_tree(&self, root_pid: u32) -> Result<Vec<ProcessInfo>>;
+    fn process_tree_memory_usage(&self, root_pid: u32) -> Result<u64> {
+        self.process_tree(root_pid)?
+            .into_iter()
+            .filter_map(|process| process.memory_bytes)
+            .reduce(u64::saturating_add)
+            .context("process tree memory is unavailable")
+    }
     fn open_path(&self, path: &Path) -> Result<()>;
+}
+
+pub(crate) fn build_process_tree(root_pid: u32, entries: Vec<ProcessEntry>) -> Vec<ProcessInfo> {
+    let mut by_pid = HashMap::new();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries {
+        children
+            .entry(entry.parent_pid)
+            .or_default()
+            .push(entry.pid);
+        by_pid.insert(entry.pid, entry);
+    }
+    for child_pids in children.values_mut() {
+        child_pids.sort_unstable();
+    }
+
+    fn append(
+        pid: u32,
+        depth: usize,
+        by_pid: &HashMap<u32, ProcessEntry>,
+        children: &HashMap<u32, Vec<u32>>,
+        visited: &mut HashSet<u32>,
+        output: &mut Vec<ProcessInfo>,
+    ) {
+        if !visited.insert(pid) {
+            return;
+        }
+        let Some(entry) = by_pid.get(&pid) else {
+            return;
+        };
+        output.push(ProcessInfo {
+            pid: entry.pid,
+            parent_pid: entry.parent_pid,
+            depth,
+            name: entry.name.clone(),
+            memory_bytes: entry.memory_bytes,
+        });
+        if let Some(child_pids) = children.get(&pid) {
+            for &child_pid in child_pids {
+                append(child_pid, depth + 1, by_pid, children, visited, output);
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    append(
+        root_pid,
+        0,
+        &by_pid,
+        &children,
+        &mut HashSet::new(),
+        &mut output,
+    );
+    output
 }
 
 #[cfg(target_os = "linux")]
@@ -43,9 +123,53 @@ pub fn adapter() -> Arc<dyn PlatformAdapter> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{configure_autostart, paths, show_error};
+pub use linux::{
+    configure_autostart, paths, prepare_shutdown_signals, show_error, wait_for_shutdown_signal,
+};
 #[cfg(windows)]
-pub use windows::{configure_autostart, paths, show_error};
+pub use windows::{configure_autostart, paths, prepare_shutdown_signals, show_error};
 
 #[cfg(not(any(target_os = "linux", windows)))]
 compile_error!("WinKeeper supports Windows and Linux only");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_tree_contains_only_root_and_descendants() {
+        let entries = vec![
+            ProcessEntry {
+                pid: 10,
+                parent_pid: 1,
+                name: "root".into(),
+                memory_bytes: Some(100),
+            },
+            ProcessEntry {
+                pid: 11,
+                parent_pid: 10,
+                name: "child".into(),
+                memory_bytes: Some(50),
+            },
+            ProcessEntry {
+                pid: 12,
+                parent_pid: 11,
+                name: "grandchild".into(),
+                memory_bytes: Some(25),
+            },
+            ProcessEntry {
+                pid: 20,
+                parent_pid: 1,
+                name: "unrelated".into(),
+                memory_bytes: Some(200),
+            },
+        ];
+        let tree = build_process_tree(10, entries);
+        assert_eq!(
+            tree.iter()
+                .map(|process| (process.pid, process.depth))
+                .collect::<Vec<_>>(),
+            vec![(10, 0), (11, 1), (12, 2)]
+        );
+    }
+}

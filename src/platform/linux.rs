@@ -1,8 +1,11 @@
-use super::{AppPaths, PlatformAdapter, ProcessGuard};
+use super::{
+    AppPaths, PlatformAdapter, ProcessEntry, ProcessGuard, ProcessInfo, build_process_tree,
+};
 use crate::core::config::ToolConfig;
 use anyhow::{Context, Result, bail};
 use nix::{
-    sys::signal::{Signal, killpg},
+    errno::Errno,
+    sys::signal::{SigSet, Signal, kill, killpg},
     unistd::Pid,
 };
 use std::{
@@ -29,24 +32,83 @@ impl PlatformAdapter for LinuxAdapter {
         }
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        // The manager blocks shutdown signals for its sigwait thread; children must not inherit it.
+        unsafe {
+            command.pre_exec(|| {
+                shutdown_signals()
+                    .thread_unblock()
+                    .map_err(std::io::Error::from)
+            });
+        }
         Ok(Box::new(ProcessGroup {
             pgid: AtomicI32::new(0),
         }))
     }
 
     fn memory_usage(&self, pid: u32) -> Result<u64> {
-        let status = fs::read_to_string(format!("/proc/{pid}/status"))
-            .context("failed to read process status")?;
-        let rss = status
+        let rollup = fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+            .context("failed to read process smaps rollup")?;
+        let pss = rollup
             .lines()
-            .find_map(|line| line.strip_prefix("VmRSS:"))
-            .context("VmRSS is missing")?
+            .find_map(|line| line.strip_prefix("Pss:"))
+            .context("Pss is missing")?
             .split_whitespace()
             .next()
-            .context("VmRSS is empty")?
+            .context("Pss is empty")?
             .parse::<u64>()
-            .context("invalid VmRSS")?;
-        Ok(rss * 1024)
+            .context("invalid Pss")?;
+        Ok(pss * 1024)
+    }
+
+    fn process_tree(&self, root_pid: u32) -> Result<Vec<ProcessInfo>> {
+        let mut processes = Vec::new();
+        for entry in fs::read_dir("/proc").context("failed to enumerate /proc")? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let stat = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(_) => continue,
+            };
+            let Some(close_paren) = stat.rfind(')') else {
+                continue;
+            };
+            let comm = stat
+                .find('(')
+                .map(|open_paren| stat[open_paren + 1..close_paren].to_owned())
+                .unwrap_or_default();
+            let Some(parent_pid) = stat[close_paren + 1..]
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let command = fs::read(entry.path().join("cmdline"))
+                .ok()
+                .map(|bytes| {
+                    String::from_utf8_lossy(&bytes)
+                        .trim_end_matches('\0')
+                        .replace('\0', " ")
+                })
+                .filter(|command| !command.is_empty())
+                .unwrap_or(comm);
+            processes.push(ProcessEntry {
+                pid,
+                parent_pid,
+                name: command,
+                memory_bytes: self.memory_usage(pid).ok(),
+            });
+        }
+        Ok(build_process_tree(root_pid, processes))
     }
 
     fn open_path(&self, path: &Path) -> Result<()> {
@@ -72,6 +134,18 @@ impl ProcessGuard for ProcessGroup {
         Ok(true)
     }
 
+    fn is_tree_running(&self) -> Result<bool> {
+        let pgid = self.pgid.load(Ordering::Acquire);
+        if pgid <= 0 {
+            return Ok(false);
+        }
+        match kill(Pid::from_raw(-pgid), None) {
+            Ok(()) | Err(Errno::EPERM) => Ok(true),
+            Err(Errno::ESRCH) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn force_stop(&self) -> Result<()> {
         let pgid = self.pgid.load(Ordering::Acquire);
         if pgid > 0 {
@@ -79,6 +153,23 @@ impl ProcessGuard for ProcessGroup {
         }
         Ok(())
     }
+}
+
+fn shutdown_signals() -> SigSet {
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGINT);
+    signals.add(Signal::SIGTERM);
+    signals
+}
+
+pub fn prepare_shutdown_signals() -> Result<()> {
+    shutdown_signals().thread_block()?;
+    Ok(())
+}
+
+pub fn wait_for_shutdown_signal() -> Result<()> {
+    shutdown_signals().wait()?;
+    Ok(())
 }
 
 pub fn paths(config_override: Option<PathBuf>) -> Result<AppPaths> {
@@ -118,7 +209,7 @@ pub fn configure_autostart(enabled: bool, config_file: &Path) -> Result<()> {
     fs::write(
         desktop,
         format!(
-            "[Desktop Entry]\nType=Application\nName=WinKeeper\nComment=Cross-platform process supervisor\nExec={} --config {}\nTerminal=false\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n",
+            "[Desktop Entry]\nType=Application\nName=WinKeeper\nComment=Cross-platform process supervisor\nExec={} --config {} --autostart\nIcon=win-keeper\nStartupWMClass=win-keeper\nTerminal=false\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n",
             quote(&exe),
             quote(config_file)
         ),

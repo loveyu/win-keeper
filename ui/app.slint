@@ -6,6 +6,7 @@ export struct ToolRow {
     memory: string,
     accent: color,
     pid: int,
+    restart-count: int,
     manager: bool,
 }
 
@@ -23,7 +24,6 @@ component ActionButton inherits Rectangle {
     Text {
         text: root.label;
         color: primary ? #102638 : #e6edf2;
-        font-family: "Trebuchet MS";
         font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -51,8 +51,30 @@ component RefreshButton inherits Rectangle {
     touch := TouchArea { enabled: !root.busy; clicked => { root.clicked(); } }
 }
 
+component InspectButton inherits Rectangle {
+    in property <string> label;
+    callback clicked;
+    width: 44px;
+    height: 28px;
+    border-radius: 7px;
+    background: touch.pressed ? #cf722b : touch.has-hover ? #31526b : #1d3b52;
+    border-width: 1px;
+    border-color: #42647b;
+    Text {
+        text: root.label;
+        color: #dce7ec;
+        font-size: 10px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
 export component AppWindow inherits Window {
     in property <bool> chinese: false;
+    in property <string> ui-font-family;
+    in property <string> code-font-family;
     title: chinese ? "WinKeeper — 进程控制台" : "WinKeeper — Process Console";
     icon: @image-url("tray-icon.png");
     preferred-width: 1120px;
@@ -60,14 +82,19 @@ export component AppWindow inherits Window {
     min-width: 880px;
     min-height: 560px;
     background: #0d2132;
-    default-font-family: "Trebuchet MS";
+    default-font-family: root.ui-font-family;
 
     in property <[ToolRow]> tools;
     in-out property <int> selected-index: -1;
     in property <string> log-text;
+    in property <string> output-timing;
     in property <string> summary;
     in property <string> config-path;
     in property <bool> memory-refreshing: false;
+    in-out property <bool> process-tree-visible: false;
+    in-out property <bool> process-tree-loading: false;
+    in property <string> process-tree-title;
+    in property <string> process-tree-text;
 
     callback start-tool(int);
     callback stop-tool(int);
@@ -78,6 +105,8 @@ export component AppWindow inherits Window {
     callback refresh-memory;
     callback open-log-file(int);
     callback open-workdir(int);
+    callback inspect-process(int);
+    callback open-config;
     callback hide-requested;
     callback exit-requested;
 
@@ -100,7 +129,20 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     alignment: center;
                     Text { text: root.summary; color: #a9bcc8; font-size: 13px; horizontal-alignment: right; }
-                    Text { text: root.config-path; color: #6f8b9c; font-size: 11px; horizontal-alignment: right; overflow: elide; }
+                    Rectangle {
+                        height: 22px;
+                        background: config-touch.has-hover ? #19374b : transparent;
+                        border-radius: 5px;
+                        Text {
+                            text: root.config-path;
+                            color: config-touch.has-hover ? #9fb9c8 : #6f8b9c;
+                            font-size: 11px;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        config-touch := TouchArea { clicked => { root.open-config(); } }
+                    }
                 }
             }
 
@@ -119,13 +161,18 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         HorizontalLayout {
                             height: 30px;
-                            Text { text: root.chinese ? "工具" : "TOOL"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; }
-                            Text { text: root.chinese ? "状态" : "STATUS"; color: #7894a5; font-size: 11px; font-weight: 700; width: 96px; }
-                            HorizontalLayout {
-                                width: 104px;
-                                spacing: 5px;
-                                Text { text: root.chinese ? "内存" : "MEMORY"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
-                                RefreshButton { busy: root.memory-refreshing; clicked => { root.refresh-memory(); } }
+                            padding-left: 12px;
+                            padding-right: 10px;
+                            spacing: 10px;
+                            Rectangle { width: 5px; background: transparent; }
+                            Text { text: root.chinese ? "工具" : "TOOL"; color: #7894a5; font-size: 11px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                            Text { text: root.chinese ? "状态" : "STATUS"; color: #7894a5; font-size: 11px; font-weight: 700; width: 96px; vertical-alignment: center; }
+                            Text { text: root.chinese ? "内存" : "MEMORY"; color: #7894a5; font-size: 11px; font-weight: 700; width: 104px; vertical-alignment: center; }
+                            Rectangle {
+                                width: 48px;
+                                height: 30px;
+                                background: transparent;
+                                RefreshButton { x: 11px; y: 2px; busy: root.memory-refreshing; clicked => { root.refresh-memory(); } }
                             }
                         }
                         ScrollView {
@@ -138,6 +185,7 @@ export component AppWindow inherits Window {
                                     background: root.selected-index == i ? #24465c : row-touch.has-hover ? #19374b : #142e41;
                                     border-width: root.selected-index == i ? 1px : 0px;
                                     border-color: row.accent;
+                                    row-touch := TouchArea { clicked => { root.selected-index = i; } }
                                     HorizontalLayout {
                                         padding-left: 12px;
                                         padding-right: 10px;
@@ -146,13 +194,32 @@ export component AppWindow inherits Window {
                                         VerticalLayout {
                                             alignment: center;
                                             Text { text: row.name; color: #edf2f4; font-size: 14px; font-weight: 600; overflow: elide; }
-                                            Text { text: row.pid > 0 ? "PID " + row.pid : root.chinese ? "无活动进程" : "No active process"; color: #718c9d; font-size: 10px; }
+                                            Text {
+                                                text: row.pid > 0
+                                                    ? "PID " + row.pid + (row.restart-count > 0 ? (root.chinese ? "  ·  重启 " : "  ·  Restarts ") + row.restart-count : "")
+                                                    : root.chinese ? "无活动进程" : "No active process";
+                                                color: #718c9d;
+                                                font-size: 10px;
+                                            }
                                         }
                                         Rectangle { horizontal-stretch: 1; background: transparent; }
                                         Text { text: row.status; color: row.accent; font-size: 12px; font-weight: 700; width: 96px; vertical-alignment: center; }
                                         Text { text: row.memory; color: #c4d0d7; font-size: 12px; width: 104px; vertical-alignment: center; }
+                                        Rectangle {
+                                            width: 48px;
+                                            height: 54px;
+                                            background: transparent;
+                                            InspectButton {
+                                                x: 2px;
+                                                y: 13px;
+                                                label: root.chinese ? "进程树" : "Tree";
+                                                clicked => {
+                                                    root.selected-index = i;
+                                                    root.inspect-process(i);
+                                                }
+                                            }
+                                        }
                                     }
-                                    row-touch := TouchArea { clicked => { root.selected-index = i; } }
                                 }
                             }
                         }
@@ -171,6 +238,13 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 30px;
                             Text { text: root.chinese ? "实时输出" : "LIVE OUTPUT"; color: #ed8b3a; font-size: 11px; font-weight: 800; letter-spacing: 1px; }
+                            Text {
+                                text: root.output-timing;
+                                color: #7894a5;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                             Text { text: root.selected-index >= 0 ? root.chinese ? "已缓存" : "BUFFERED" : root.chinese ? "空闲" : "IDLE"; color: #6f8b9c; font-size: 10px; }
                         }
@@ -178,7 +252,7 @@ export component AppWindow inherits Window {
                             vertical-stretch: 1;
                             text: root.log-text;
                             read-only: true;
-                            font-family: "Consolas";
+                            font-family: root.code-font-family;
                             font-size: 11px;
                             wrap: word-wrap;
                         }
@@ -205,6 +279,62 @@ export component AppWindow inherits Window {
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 ActionButton { width: 72px; label: root.chinese ? "隐藏" : "Hide"; clicked => { root.hide-requested(); } }
                 ActionButton { width: 66px; label: root.chinese ? "退出" : "Exit"; clicked => { root.exit-requested(); } }
+            }
+        }
+    }
+
+    if root.process-tree-visible : Rectangle {
+        background: #06131dcc;
+        backdrop-touch := TouchArea { clicked => { root.process-tree-visible = false; } }
+        dialog := Rectangle {
+            width: root.width < 900px ? root.width - 60px : 820px;
+            height: root.height < 640px ? root.height - 60px : 560px;
+            x: (root.width - dialog.width) / 2;
+            y: (root.height - dialog.height) / 2;
+            background: #10283a;
+            border-width: 1px;
+            border-color: #42647b;
+            border-radius: 14px;
+            panel-touch := TouchArea {}
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                HorizontalLayout {
+                    height: 40px;
+                    Text { text: root.process-tree-title; color: #f1f4f5; font-size: 18px; font-weight: 700; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    ActionButton { width: 88px; label: root.chinese ? "关闭" : "Close"; clicked => { root.process-tree-visible = false; } }
+                }
+                if root.process-tree-loading : Rectangle {
+                    vertical-stretch: 1;
+                    background: #0b2030;
+                    border-radius: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 12px;
+                        Text {
+                            text: "…";
+                            color: #ed8b3a;
+                            font-size: 36px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: root.chinese ? "正在读取进程信息…" : "Loading process information…";
+                            color: #a9bcc8;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+                if !root.process-tree-loading : TextEdit {
+                    vertical-stretch: 1;
+                    text: root.process-tree-text;
+                    read-only: true;
+                    font-family: root.code-font-family;
+                    font-size: 12px;
+                    wrap: no-wrap;
+                }
             }
         }
     }

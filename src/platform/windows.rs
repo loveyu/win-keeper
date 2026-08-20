@@ -1,4 +1,6 @@
-use super::{AppPaths, PlatformAdapter, ProcessGuard};
+use super::{
+    AppPaths, PlatformAdapter, ProcessEntry, ProcessGuard, ProcessInfo, build_process_tree,
+};
 use crate::core::config::ToolConfig;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -9,14 +11,19 @@ use std::{
     ptr::{null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, HWND},
+    Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE},
     System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
-        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX},
         Registry::{
             HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
             RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
@@ -60,14 +67,49 @@ impl PlatformAdapter for WindowsAdapter {
         if process.is_null() {
             return Err(std::io::Error::last_os_error()).context("OpenProcess failed");
         }
-        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
-        counters.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        let ok = unsafe { K32GetProcessMemoryInfo(process, &mut counters, counters.cb) };
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { zeroed() };
+        counters.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                process,
+                (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+                counters.cb,
+            )
+        };
         unsafe { CloseHandle(process) };
         if ok == 0 {
             return Err(std::io::Error::last_os_error()).context("GetProcessMemoryInfo failed");
         }
-        Ok(counters.WorkingSetSize as u64)
+        Ok(counters.PrivateUsage as u64)
+    }
+
+    fn process_tree(&self, root_pid: u32) -> Result<Vec<ProcessInfo>> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error()).context("CreateToolhelp32Snapshot failed");
+        }
+        let mut processes = Vec::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        while has_entry {
+            let name_len = entry
+                .szExeFile
+                .iter()
+                .position(|&value| value == 0)
+                .unwrap_or(entry.szExeFile.len());
+            processes.push(ProcessEntry {
+                pid: entry.th32ProcessID,
+                parent_pid: entry.th32ParentProcessID,
+                name: String::from_utf16_lossy(&entry.szExeFile[..name_len]),
+                memory_bytes: self.memory_usage(entry.th32ProcessID).ok(),
+            });
+            has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+        unsafe { CloseHandle(snapshot) };
+        Ok(build_process_tree(root_pid, processes))
     }
 
     fn open_path(&self, path: &Path) -> Result<()> {
@@ -127,12 +169,34 @@ impl ProcessGuard for JobObject {
         Ok(false)
     }
 
+    fn is_tree_running(&self) -> Result<bool> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("QueryInformationJobObject failed");
+        }
+        Ok(accounting.ActiveProcesses > 0)
+    }
+
     fn force_stop(&self) -> Result<()> {
         if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
             return Err(std::io::Error::last_os_error()).context("TerminateJobObject failed");
         }
         Ok(())
     }
+}
+
+pub fn prepare_shutdown_signals() -> Result<()> {
+    Ok(())
 }
 
 impl Drop for JobObject {
@@ -176,7 +240,7 @@ pub fn configure_autostart(enabled: bool, config_file: &Path) -> Result<()> {
     }
     let operation = if enabled {
         let command = format!(
-            "\"{}\" --config \"{}\"",
+            "\"{}\" --config \"{}\" --autostart",
             std::env::current_exe()?.display(),
             config_file.display()
         );

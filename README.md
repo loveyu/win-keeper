@@ -8,8 +8,8 @@ Release artifacts are produced for:
 
 | Platform | Architecture | Process tree | Memory source | Autostart |
 | --- | --- | --- | --- | --- |
-| Windows 10/11 | x86_64, ARM64 | Job Object | Working Set | `HKCU\\...\\Run` |
-| Linux Desktop | x86_64, ARM64 | Process Group | `/proc/<pid>/status` VmRSS | XDG autostart |
+| Windows 10/11 | x86_64, ARM64 | Job Object | Process-tree PrivateUsage | `HKCU\\...\\Run` |
+| Linux Desktop | x86_64, ARM64 | Process Group | Process-tree `/proc/<pid>/smaps_rollup` PSS | XDG autostart |
 
 Linux targets Debian/Ubuntu desktop environments, KDE Plasma and GNOME, on X11 or Wayland. macOS is not supported.
 
@@ -24,6 +24,7 @@ Linux targets Debian/Ubuntu desktop environments, KDE Plasma and GNOME, on X11 o
 - Windows Job Objects and Linux process groups for descendant cleanup
 - One-shot asynchronous memory sampling when the manager opens or Memory is clicked
 - Native per-user autostart integration
+- Per-user single-instance enforcement
 - Hidden-to-tray startup and close-to-tray behavior
 
 The first-stage MVP intentionally rejects `admin = true`. Windows UAC/elevated helper and Linux Polkit integration are planned separately so WinKeeper never silently runs an administrator-designated tool without elevation.
@@ -41,10 +42,11 @@ WinKeeper creates an empty valid configuration on first launch. Use [config.exam
 
 ```toml
 [manager]
+lang = "zh_CN"
 start_with_system = true
 minimize_to_tray = true
 log_buffer_lines = 10000
-stop_timeout_ms = 5000
+stop_timeout_ms = 30000
 
 [[tools]]
 name = "worker"
@@ -59,15 +61,17 @@ max_restart_count = 5
 restart_window_seconds = 60
 ```
 
+Set `manager.lang` to an English or Chinese locale such as `en`, `en_US`, `zh`, or `zh_CN` to override automatic language detection. Omit it to use the operating system language.
+
 After changing `config.toml`, exit and restart WinKeeper. Settings opens the active configuration in the operating system's associated editor.
 
 ## Command line
 
 ```text
-win-keeper [--config PATH] [--check-config] [--show]
+win-keeper [--config PATH] [--check-config] [--show] [--autostart]
 ```
 
-`--show` opens the manager immediately. Without it, WinKeeper starts in the tray when `minimize_to_tray` is enabled.
+Normal launches open the manager immediately. System autostart entries use the internal `--autostart` flag to start WinKeeper in the tray when `minimize_to_tray` is enabled. Click the tray icon to open the manager; `--show` explicitly opens it as well.
 
 ## Build
 
@@ -99,4 +103,3 @@ Core never calls Win32, Unix signals, or `/proc` directly. Platform differences 
 ## License
 
 Apache-2.0. Slint is used under its applicable royalty-free/open-source licensing terms.
-

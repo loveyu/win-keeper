@@ -12,6 +12,7 @@ pub struct AppConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ManagerConfig {
+    pub lang: Option<String>,
     pub start_with_system: bool,
     pub minimize_to_tray: bool,
     pub log_buffer_lines: usize,
@@ -36,10 +37,11 @@ pub struct ToolConfig {
 impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
+            lang: None,
             start_with_system: true,
             minimize_to_tray: true,
             log_buffer_lines: 10_000,
-            stop_timeout_ms: 5_000,
+            stop_timeout_ms: 30_000,
         }
     }
 }
@@ -79,6 +81,14 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if self
+            .manager
+            .lang
+            .as_deref()
+            .is_some_and(|lang| configured_chinese(lang).is_none())
+        {
+            bail!("manager.lang must be an English or Chinese locale, such as 'en' or 'zh_CN'");
+        }
         if self.manager.log_buffer_lines == 0 {
             bail!("manager.log_buffer_lines must be greater than zero");
         }
@@ -104,6 +114,21 @@ impl AppConfig {
     }
 }
 
+pub fn configured_chinese(lang: &str) -> Option<bool> {
+    match lang
+        .trim()
+        .split(['_', '-', '.'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "zh" => Some(true),
+        "en" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +138,14 @@ mod tests {
         let raw = include_str!("../../config.example.toml");
         let config: AppConfig = toml::from_str(raw).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn configured_language_accepts_common_locales() {
+        assert_eq!(configured_chinese("zh_CN"), Some(true));
+        assert_eq!(configured_chinese("zh-CN"), Some(true));
+        assert_eq!(configured_chinese("en_US"), Some(false));
+        assert_eq!(configured_chinese("en-US"), Some(false));
+        assert_eq!(configured_chinese("C.UTF-8"), None);
     }
 }

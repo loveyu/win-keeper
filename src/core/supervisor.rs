@@ -2,7 +2,7 @@ use super::{
     config::{AppConfig, ToolConfig},
     logging::ToolLog,
 };
-use crate::platform::{AppPaths, PlatformAdapter, ProcessGuard};
+use crate::platform::{AppPaths, PlatformAdapter, ProcessGuard, ProcessInfo};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,6 +44,10 @@ pub struct ToolSnapshot {
     pub state: ToolState,
     pub pid: Option<u32>,
     pub memory: MemoryValue,
+    #[serde(default)]
+    pub restart_count: usize,
+    #[serde(default)]
+    pub started_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -52,6 +56,7 @@ struct Runtime {
     pid: Option<u32>,
     memory: MemoryValue,
     restart_count: usize,
+    started_at_unix_ms: Option<u64>,
 }
 
 enum Control {
@@ -99,6 +104,7 @@ impl Supervisor {
                 pid: None,
                 memory: MemoryValue::Idle,
                 restart_count: 0,
+                started_at_unix_ms: None,
             }));
             let log = Arc::new(ToolLog::new(
                 &paths.log_directory,
@@ -167,6 +173,8 @@ impl Supervisor {
                     state: runtime.state,
                     pid: runtime.pid,
                     memory: runtime.memory,
+                    restart_count: runtime.restart_count,
+                    started_at_unix_ms: runtime.started_at_unix_ms,
                 }
             })
             .collect()
@@ -175,6 +183,19 @@ impl Supervisor {
     pub fn manager_memory(&self) -> MemoryValue {
         *self.manager_memory.lock().unwrap()
     }
+
+    pub fn process_tree(&self, index: usize) -> Result<(String, Vec<ProcessInfo>)> {
+        let (name, pid) = if let Some(tool) = self.tools.get(index) {
+            (tool.config.name.clone(), tool.runtime.lock().unwrap().pid)
+        } else if index == self.tools.len() {
+            ("WinKeeper".into(), Some(std::process::id()))
+        } else {
+            anyhow::bail!("invalid tool index");
+        };
+        let pid = pid.context("process is not running")?;
+        Ok((name, self.platform.process_tree(pid)?))
+    }
+
     pub fn config_path(&self) -> &Path {
         &self.paths.config_file
     }
@@ -261,7 +282,7 @@ impl Supervisor {
         let manager_memory = self.manager_memory.clone();
         thread::spawn(move || {
             let value = platform
-                .memory_usage(std::process::id())
+                .process_tree_memory_usage(std::process::id())
                 .map(MemoryValue::Bytes)
                 .unwrap_or(MemoryValue::Unavailable);
             *manager_memory.lock().unwrap() = value;
@@ -294,7 +315,7 @@ impl Supervisor {
             let platform = self.platform.clone();
             thread::spawn(move || {
                 let value = platform
-                    .memory_usage(pid)
+                    .process_tree_memory_usage(pid)
                     .map(MemoryValue::Bytes)
                     .unwrap_or(MemoryValue::Unavailable);
                 let mut current = runtime.lock().unwrap();
@@ -307,6 +328,21 @@ impl Supervisor {
 
     pub fn minimize_to_tray(&self) -> bool {
         self.config.manager.minimize_to_tray
+    }
+
+    pub fn configured_chinese(&self) -> Option<bool> {
+        self.config
+            .manager
+            .lang
+            .as_deref()
+            .and_then(super::config::configured_chinese)
+    }
+
+    pub fn take_activation_request(&self) -> bool {
+        super::single_instance::SingleInstanceGuard::take_activation_request(
+            &self.paths.state_directory,
+        )
+        .unwrap_or(false)
     }
 
     fn send(&self, index: usize, control: Control) {
@@ -352,8 +388,10 @@ fn worker_loop(
             Ok(Control::Start) => {
                 desired_running = true;
                 next_start = Some(Instant::now());
-                restarts.clear();
-                runtime.lock().unwrap().restart_count = 0;
+                if process.is_none() {
+                    restarts.clear();
+                    runtime.lock().unwrap().restart_count = 0;
+                }
             }
             Ok(Control::Stop) => {
                 desired_running = false;
@@ -363,7 +401,12 @@ fn worker_loop(
             Ok(Control::Restart) => {
                 desired_running = true;
                 next_start = Some(Instant::now());
-                runtime.lock().unwrap().state = ToolState::Restarting;
+                let mut state = runtime.lock().unwrap();
+                state.state = ToolState::Restarting;
+                if process.is_some() {
+                    state.restart_count += 1;
+                }
+                drop(state);
                 stop_process(&mut process, &runtime, &log, stop_timeout);
             }
             #[cfg(windows)]
@@ -383,6 +426,7 @@ fn worker_loop(
                     let mut state = runtime.lock().unwrap();
                     state.pid = None;
                     state.memory = MemoryValue::Idle;
+                    state.started_at_unix_ms = None;
                     if desired_running && config.auto_restart {
                         let now = Instant::now();
                         let window = Duration::from_secs(config.restart_window_seconds);
@@ -518,6 +562,8 @@ fn spawn_elevated_proxy_worker(
                         current.state = state.snapshot.state;
                         current.pid = state.snapshot.pid;
                         current.memory = state.snapshot.memory;
+                        current.restart_count = state.snapshot.restart_count;
+                        current.started_at_unix_ms = state.snapshot.started_at_unix_ms;
                     }
                     Ok(_) | Err(_) => {
                         let since = unavailable_since.get_or_insert_with(Instant::now);
@@ -530,6 +576,7 @@ fn spawn_elevated_proxy_worker(
                             };
                             current.pid = None;
                             current.memory = MemoryValue::Unavailable;
+                            current.started_at_unix_ms = None;
                         }
                     }
                 }
@@ -577,6 +624,7 @@ fn start_process(
         state.state = ToolState::Running;
         state.pid = Some(pid);
         state.memory = MemoryValue::Idle;
+        state.started_at_unix_ms = Some(unix_ms());
     }
     log.write("manager", &format!("process started, pid={pid}"));
     Ok(ManagedProcess { child, guard })
@@ -618,6 +666,7 @@ fn stop_process(
         state.state = ToolState::Stopped;
         state.pid = None;
         state.memory = MemoryValue::Idle;
+        state.started_at_unix_ms = None;
         return;
     };
     runtime.lock().unwrap().state = ToolState::Stopping;
@@ -625,22 +674,36 @@ fn stop_process(
     if graceful {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if active.child.try_wait().ok().flatten().is_some() {
+            let _ = active.child.try_wait();
+            if !active.guard.is_tree_running().unwrap_or(true) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
-    if active.child.try_wait().ok().flatten().is_none() {
+    let _ = active.child.try_wait();
+    if active.guard.is_tree_running().unwrap_or(true) {
+        log.write(
+            "manager",
+            "graceful stop timed out; forcing process tree stop",
+        );
         if let Err(error) = active.guard.force_stop() {
             log.write("manager", &format!("force stop failed: {error:#}"));
         }
-        let _ = active.child.wait();
     }
+    let _ = active.child.wait();
     *process = None;
     let mut state = runtime.lock().unwrap();
     state.state = ToolState::Stopped;
     state.pid = None;
     state.memory = MemoryValue::Idle;
+    state.started_at_unix_ms = None;
     log.write("manager", "process stopped");
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

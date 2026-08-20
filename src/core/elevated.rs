@@ -191,5 +191,7 @@ fn _state_defaults(name: String) -> ToolSnapshot {
         state: ToolState::Stopped,
         pid: None,
         memory: MemoryValue::Idle,
+        restart_count: 0,
+        started_at_unix_ms: None,
     }
 }
