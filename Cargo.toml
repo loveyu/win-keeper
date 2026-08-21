@@ -1,6 +1,6 @@
 [package]
 name = "win-keeper"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "A lightweight cross-platform desktop process supervisor"
 license = "Apache-2.0"
