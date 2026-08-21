@@ -32,7 +32,13 @@ fn run() -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             let (pgid, timeout_ms) = watchdog;
-            return platform::run_process_watchdog(pgid, Duration::from_millis(timeout_ms));
+            return platform::run_process_watchdog(
+                pgid,
+                Duration::from_millis(timeout_ms),
+                args.scope_unit,
+                args.scope_cgroup,
+                args.scope_systemctl,
+            );
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -110,6 +116,9 @@ struct Args {
     manifest: Option<PathBuf>,
     state_directory: Option<PathBuf>,
     process_watchdog: Option<(i32, u64)>,
+    scope_unit: Option<String>,
+    scope_cgroup: Option<PathBuf>,
+    scope_systemctl: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -150,6 +159,24 @@ fn parse_args() -> Result<Args> {
                     .parse::<u64>()
                     .context("invalid watchdog stop timeout")?;
                 parsed.process_watchdog = Some((pgid, timeout_ms));
+            }
+            "--scope-unit" => {
+                parsed.scope_unit = Some(
+                    args.next()
+                        .context("--scope-unit requires a unit name")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--scope-cgroup" => {
+                parsed.scope_cgroup = Some(PathBuf::from(
+                    args.next().context("--scope-cgroup requires a path")?,
+                ));
+            }
+            "--scope-systemctl" => {
+                parsed.scope_systemctl = Some(PathBuf::from(
+                    args.next().context("--scope-systemctl requires a path")?,
+                ));
             }
             "--version" | "-V" => {
                 println!("win-keeper {}", env!("CARGO_PKG_VERSION"));

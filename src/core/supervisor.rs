@@ -667,11 +667,7 @@ fn start_process(
 ) -> Result<ManagedProcess> {
     runtime.lock().unwrap().state = ToolState::Starting;
     let mut command = Command::new(&config.command);
-    command
-        .args(&config.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(&config.args);
     if let Some(workdir) = &config.workdir {
         if !Path::new(workdir).is_dir() {
             anyhow::bail!("working directory does not exist: {workdir}");
@@ -679,6 +675,10 @@ fn start_process(
         command.current_dir(workdir);
     }
     let mut guard = platform.prepare_command(&mut command, config, stop_timeout)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to execute {}", config.command))?;

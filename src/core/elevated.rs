@@ -1,5 +1,6 @@
 use super::{
     config::AppConfig,
+    single_instance::SingleInstanceGuard,
     supervisor::{MemoryValue, Supervisor, ToolSnapshot, ToolState},
 };
 use crate::platform::{self, AppPaths};
@@ -19,7 +20,7 @@ use std::{
 
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ElevatedCommand {
     Start,
@@ -46,6 +47,10 @@ impl ElevatedState {
 }
 
 pub fn run_helper(manifest: &Path, state_directory: &Path) -> Result<()> {
+    let helper_instance_directory = elevated_root(state_directory).join("helper-instance");
+    let Some(_helper_guard) = SingleInstanceGuard::try_acquire(&helper_instance_directory)? else {
+        return Ok(());
+    };
     let mut config = AppConfig::load_or_create(manifest)
         .with_context(|| format!("failed to load elevated manifest {}", manifest.display()))?;
     config.tools.retain(|tool| tool.admin);
@@ -72,6 +77,7 @@ pub fn run_helper(manifest: &Path, state_directory: &Path) -> Result<()> {
     let supervisor = Arc::new(Supervisor::new(config, paths, platform::adapter())?);
     let control_directory = elevated_root(state_directory).join("control");
     fs::create_dir_all(&control_directory)?;
+    recover_claimed_commands(&control_directory);
     let mut last_snapshots = Vec::new();
     let mut last_publish = Instant::now() - Duration::from_secs(3);
 
@@ -79,6 +85,9 @@ pub fn run_helper(manifest: &Path, state_directory: &Path) -> Result<()> {
         if let Ok(entries) = fs::read_dir(&control_directory) {
             for entry in entries.flatten() {
                 let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("command") {
+                    continue;
+                }
                 let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
                     continue;
                 };
@@ -88,10 +97,14 @@ pub fn run_helper(manifest: &Path, state_directory: &Path) -> Result<()> {
                 let Some(&index) = index_by_key.get(key) else {
                     continue;
                 };
-                let request = fs::read_to_string(&path)
+                let claimed = path.with_extension(format!("processing-{}", std::process::id()));
+                if fs::rename(&path, &claimed).is_err() {
+                    continue;
+                }
+                let request = fs::read_to_string(&claimed)
                     .ok()
                     .and_then(|raw| toml::from_str::<CommandRequest>(&raw).ok());
-                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(&claimed);
                 match request.map(|request| request.command) {
                     Some(ElevatedCommand::Start) => supervisor.start(index),
                     Some(ElevatedCommand::Stop) => supervisor.stop(index),
@@ -125,7 +138,9 @@ pub(crate) fn send_command(
         .saturating_mul(1_000)
         .saturating_add(COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed) % 1_000);
     let path = directory.join(format!("{}.{nonce}.command", tool_key(tool_name)));
-    fs::write(path, toml::to_string(&CommandRequest { command })?)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, toml::to_string(&CommandRequest { command })?)?;
+    fs::rename(temporary, path)?;
     Ok(())
 }
 
@@ -142,7 +157,11 @@ fn publish_state(state_directory: &Path, snapshot: &ToolSnapshot) -> Result<()> 
     let directory = elevated_root(state_directory);
     fs::create_dir_all(&directory)?;
     let target = directory.join(format!("{}.state.toml", tool_key(&snapshot.name)));
-    let temporary = directory.join(format!("{}.state.tmp", tool_key(&snapshot.name)));
+    let temporary = directory.join(format!(
+        "{}.state.{}.tmp",
+        tool_key(&snapshot.name),
+        std::process::id()
+    ));
     let state = ElevatedState {
         snapshot: snapshot.clone(),
         updated_unix_ms: unix_ms(),
@@ -151,6 +170,25 @@ fn publish_state(state_directory: &Path, snapshot: &ToolSnapshot) -> Result<()> 
     let _ = fs::remove_file(&target);
     fs::rename(temporary, target)?;
     Ok(())
+}
+
+fn recover_claimed_commands(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !extension.starts_with("processing-") {
+            continue;
+        }
+        let command = path.with_extension("command");
+        if !command.exists() {
+            let _ = fs::rename(path, command);
+        }
+    }
 }
 
 fn elevated_root(state_directory: &Path) -> PathBuf {
@@ -193,5 +231,53 @@ fn _state_defaults(name: String) -> ToolSnapshot {
         memory: MemoryValue::Idle,
         restart_count: 0,
         started_at_unix_ms: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovers_a_command_claimed_by_a_crashed_helper() {
+        let directory = std::env::temp_dir().join(format!(
+            "winkeeper-elevated-recovery-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let claimed = directory.join("tool.123.processing-999");
+        fs::write(&claimed, "command = \"start\"\n").unwrap();
+
+        recover_claimed_commands(&directory);
+
+        assert!(!claimed.exists());
+        assert!(directory.join("tool.123.command").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publishes_a_complete_command_atomically() {
+        let state_directory = std::env::temp_dir().join(format!(
+            "winkeeper-elevated-command-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&state_directory);
+        send_command(&state_directory, "Admin Tool", ElevatedCommand::Restart).unwrap();
+        let control = elevated_root(&state_directory).join("control");
+        let files = fs::read_dir(&control)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].extension().and_then(|value| value.to_str()),
+            Some("command")
+        );
+        let request: CommandRequest =
+            toml::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+        assert_eq!(request.command, ElevatedCommand::Restart);
+        fs::remove_dir_all(state_directory).unwrap();
     }
 }

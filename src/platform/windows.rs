@@ -16,7 +16,7 @@ use windows_sys::Win32::{
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-            TH32CS_SNAPPROCESS,
+            TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
         },
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -30,8 +30,8 @@ use windows_sys::Win32::{
             RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
         },
         Threading::{
-            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, OpenProcess, PROCESS_QUERY_INFORMATION,
-            PROCESS_VM_READ,
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcess, OpenThread,
+            PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, ResumeThread, THREAD_SUSPEND_RESUME,
         },
     },
     UI::{
@@ -60,7 +60,7 @@ impl PlatformAdapter for WindowsAdapter {
                 "admin=true requires the elevated helper, which is outside the first-stage Windows MVP"
             );
         }
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_SUSPENDED);
         Ok(Box::new(JobObject::new()?))
     }
 
@@ -164,6 +164,8 @@ impl ProcessGuard for JobObject {
         if unsafe { AssignProcessToJobObject(self.handle, process) } == 0 {
             return Err(std::io::Error::last_os_error()).context("AssignProcessToJobObject failed");
         }
+        resume_process(child.id())
+            .context("failed to resume process after Job Object attachment")?;
         Ok(())
     }
 
@@ -195,6 +197,44 @@ impl ProcessGuard for JobObject {
         }
         Ok(())
     }
+}
+
+fn resume_process(pid: u32) -> Result<()> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .context("CreateToolhelp32Snapshot for threads failed");
+    }
+
+    let result = (|| {
+        let mut entry = THREADENTRY32 {
+            dwSize: size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        let mut resumed = false;
+        while has_entry {
+            if entry.th32OwnerProcessID == pid {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(std::io::Error::last_os_error()).context("OpenThread failed");
+                }
+                let previous_count = unsafe { ResumeThread(thread) };
+                unsafe { CloseHandle(thread) };
+                if previous_count == u32::MAX {
+                    return Err(std::io::Error::last_os_error()).context("ResumeThread failed");
+                }
+                resumed = true;
+            }
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        }
+        if !resumed {
+            bail!("no thread found for suspended process {pid}");
+        }
+        Ok(())
+    })();
+    unsafe { CloseHandle(snapshot) };
+    result
 }
 
 pub fn prepare_shutdown_signals() -> Result<()> {
@@ -282,4 +322,36 @@ pub fn show_error(title: &str, message: &str) {
 
 fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+
+    #[test]
+    fn process_is_resumed_only_after_job_attachment() {
+        let adapter = WindowsAdapter;
+        let config = ToolConfig {
+            name: "job-attachment-test".into(),
+            command: "cmd.exe".into(),
+            args: vec!["/C".into(), "exit 0".into()],
+            ..ToolConfig::default()
+        };
+        let mut command = Command::new(&config.command);
+        command
+            .args(&config.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut guard = adapter
+            .prepare_command(&mut command, &config, Duration::from_secs(1))
+            .unwrap();
+        let mut child = command.spawn().unwrap();
+
+        assert!(child.try_wait().unwrap().is_none());
+        guard.attach(&child).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!guard.is_tree_running().unwrap());
+    }
 }

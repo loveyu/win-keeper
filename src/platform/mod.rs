@@ -61,7 +61,16 @@ pub trait PlatformAdapter: Send + Sync {
     fn open_path(&self, path: &Path) -> Result<()>;
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn build_process_tree(root_pid: u32, entries: Vec<ProcessEntry>) -> Vec<ProcessInfo> {
+    build_process_tree_with_members(root_pid, entries, HashSet::new())
+}
+
+pub(crate) fn build_process_tree_with_members(
+    root_pid: u32,
+    entries: Vec<ProcessEntry>,
+    mut member_pids: HashSet<u32>,
+) -> Vec<ProcessInfo> {
     let mut by_pid = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for entry in entries {
@@ -104,20 +113,40 @@ pub(crate) fn build_process_tree(root_pid: u32, entries: Vec<ProcessEntry>) -> V
     }
 
     let mut output = Vec::new();
-    append(
-        root_pid,
-        0,
-        &by_pid,
-        &children,
-        &mut HashSet::new(),
-        &mut output,
-    );
+    let mut visited = HashSet::new();
+    append(root_pid, 0, &by_pid, &children, &mut visited, &mut output);
+
+    member_pids.insert(root_pid);
+    let mut detached_roots = member_pids
+        .iter()
+        .copied()
+        .filter(|pid| {
+            !visited.contains(pid)
+                && by_pid
+                    .get(pid)
+                    .is_some_and(|entry| !member_pids.contains(&entry.parent_pid))
+        })
+        .collect::<Vec<_>>();
+    detached_roots.sort_unstable();
+    for pid in detached_roots {
+        append(pid, 1, &by_pid, &children, &mut visited, &mut output);
+    }
+
+    // Defensive fallback for malformed/cyclic snapshots: every selected member must be visible.
+    let mut remaining = member_pids
+        .into_iter()
+        .filter(|pid| !visited.contains(pid))
+        .collect::<Vec<_>>();
+    remaining.sort_unstable();
+    for pid in remaining {
+        append(pid, 1, &by_pid, &children, &mut visited, &mut output);
+    }
     output
 }
 
 #[cfg(target_os = "linux")]
 pub fn adapter() -> Arc<dyn PlatformAdapter> {
-    Arc::new(linux::LinuxAdapter)
+    Arc::new(linux::LinuxAdapter::new())
 }
 #[cfg(windows)]
 pub fn adapter() -> Arc<dyn PlatformAdapter> {
@@ -173,6 +202,43 @@ mod tests {
                 .map(|process| (process.pid, process.depth))
                 .collect::<Vec<_>>(),
             vec![(10, 0), (11, 1), (12, 2)]
+        );
+    }
+
+    #[test]
+    fn process_tree_can_include_reparented_group_members() {
+        let entries = vec![
+            ProcessEntry {
+                pid: 10,
+                parent_pid: 1,
+                name: "root".into(),
+                memory_bytes: Some(100),
+            },
+            ProcessEntry {
+                pid: 11,
+                parent_pid: 10,
+                name: "child".into(),
+                memory_bytes: Some(50),
+            },
+            ProcessEntry {
+                pid: 12,
+                parent_pid: 1,
+                name: "reparented".into(),
+                memory_bytes: Some(25),
+            },
+            ProcessEntry {
+                pid: 20,
+                parent_pid: 1,
+                name: "unrelated".into(),
+                memory_bytes: Some(200),
+            },
+        ];
+        let tree = build_process_tree_with_members(10, entries, HashSet::from([10, 11, 12]));
+        assert_eq!(
+            tree.iter()
+                .map(|process| (process.pid, process.depth))
+                .collect::<Vec<_>>(),
+            vec![(10, 0), (11, 1), (12, 1)]
         );
     }
 }

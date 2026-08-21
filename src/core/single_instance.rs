@@ -81,11 +81,20 @@ mod tests {
                 .is_none()
         );
         drop(first);
-        assert!(
-            SingleInstanceGuard::try_acquire(&directory)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if SingleInstanceGuard::try_acquire(&directory)
                 .unwrap()
                 .is_some()
-        );
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "instance lock was not released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
