@@ -99,13 +99,19 @@ impl Supervisor {
         platform: Arc<dyn PlatformAdapter>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&paths.state_directory)?;
+        ToolLog::migrate_legacy_logs(
+            &paths.log_directory,
+            config.tools.iter().map(|tool| tool.name.as_str()),
+        )?;
         let manager_memory = Arc::new(Mutex::new(MemoryValue::Idle));
         schedule_initial_manager_memory_refresh(manager_memory.clone(), platform.clone());
         let manager_started_at_unix_ms = unix_ms();
-        let manager_log = Arc::new(ToolLog::new(
+        let manager_log = Arc::new(ToolLog::new_manager(
             &paths.log_directory,
-            "win-keeper-manager",
             config.manager.log_buffer_lines,
+            config.manager.log_buffer_bytes,
+            config.manager.log_file_max_bytes,
+            config.manager.log_line_max_bytes,
         )?);
         manager_log.write(
             "manager",
@@ -130,6 +136,9 @@ impl Supervisor {
                 &paths.log_directory,
                 &tool.name,
                 config.manager.log_buffer_lines,
+                config.manager.log_buffer_bytes,
+                config.manager.log_file_max_bytes,
+                config.manager.log_line_max_bytes,
             )?);
             let (tx, rx) = mpsc::channel();
             #[cfg(windows)]
@@ -477,6 +486,12 @@ fn worker_loop(
         }
 
         if let Some(active) = process.as_mut() {
+            if let Err(error) = active.guard.check_health() {
+                log.write(
+                    "manager",
+                    &format!("managed process protection is degraded: {error:#}"),
+                );
+            }
             match active.child.try_wait() {
                 Ok(Some(status)) => {
                     log.write("manager", &format!("process exited with {status}"));
@@ -579,19 +594,29 @@ fn spawn_elevated_proxy_worker(
     thread::Builder::new()
         .name(format!("elevated-proxy-{}", config.name))
         .spawn(move || {
-            use crate::core::elevated::{ElevatedCommand, read_state, send_command};
+            use crate::core::elevated::{ElevatedCommand, read_state, resend_command, send_command};
 
             let mut desired_running = config.auto_start;
             let mut unavailable_since = Some(Instant::now());
+            let mut helper_started_unix_ms = None;
+            let mut pending_command: Option<(u64, ElevatedCommand, Instant)> = None;
+            let mut last_state_error = None;
+            let mut desired_state_satisfied = false;
+            let mut last_desired_issue = None;
             if desired_running {
                 runtime.lock().unwrap().state = ToolState::Starting;
-                if let Err(error) =
-                    send_command(&state_directory, &config.name, ElevatedCommand::Start)
-                {
-                    log.write(
-                        "manager",
-                        &format!("failed to contact elevated helper: {error:#}"),
-                    );
+                match send_command(&state_directory, &config.name, ElevatedCommand::Start) {
+                    Ok(id) => {
+                        let issued = Instant::now();
+                        pending_command = Some((id, ElevatedCommand::Start, issued));
+                        last_desired_issue = Some(issued);
+                    }
+                    Err(error) => {
+                        log.write(
+                            "manager",
+                            &format!("failed to contact elevated helper: {error:#}"),
+                        );
+                    }
                 }
             }
 
@@ -599,30 +624,55 @@ fn spawn_elevated_proxy_worker(
                 match receiver.recv_timeout(Duration::from_millis(250)) {
                     Ok(Control::Start) => {
                         desired_running = true;
+                        desired_state_satisfied = false;
                         runtime.lock().unwrap().state = ToolState::Starting;
-                        let _ =
-                            send_command(&state_directory, &config.name, ElevatedCommand::Start);
+                        pending_command = queue_elevated_command(
+                            &state_directory,
+                            &config.name,
+                            ElevatedCommand::Start,
+                            &log,
+                        );
+                        last_desired_issue = Some(Instant::now());
                     }
                     Ok(Control::Stop) => {
                         desired_running = false;
+                        desired_state_satisfied = false;
                         runtime.lock().unwrap().state = ToolState::Stopping;
-                        let _ = send_command(&state_directory, &config.name, ElevatedCommand::Stop);
+                        pending_command = queue_elevated_command(
+                            &state_directory,
+                            &config.name,
+                            ElevatedCommand::Stop,
+                            &log,
+                        );
+                        last_desired_issue = Some(Instant::now());
                     }
                     Ok(Control::Restart) => {
                         desired_running = true;
+                        desired_state_satisfied = false;
                         runtime.lock().unwrap().state = ToolState::Restarting;
-                        let _ =
-                            send_command(&state_directory, &config.name, ElevatedCommand::Restart);
+                        pending_command = queue_elevated_command(
+                            &state_directory,
+                            &config.name,
+                            ElevatedCommand::Restart,
+                            &log,
+                        );
+                        last_desired_issue = Some(Instant::now());
                     }
                     Ok(Control::SampleMemory) => {
-                        let _ = send_command(
+                        let _ = queue_elevated_command(
                             &state_directory,
                             &config.name,
                             ElevatedCommand::SampleMemory,
+                            &log,
                         );
                     }
                     Ok(Control::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        let _ = send_command(&state_directory, &config.name, ElevatedCommand::Stop);
+                        let _ = queue_elevated_command(
+                            &state_directory,
+                            &config.name,
+                            ElevatedCommand::Stop,
+                            &log,
+                        );
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -631,6 +681,112 @@ fn spawn_elevated_proxy_worker(
                 match read_state(&state_directory, &config.name) {
                     Ok(Some(state)) if state.is_fresh() => {
                         unavailable_since = None;
+                        last_state_error = None;
+                        let helper_first_seen = helper_started_unix_ms.is_none();
+                        let helper_changed = helper_started_unix_ms
+                            .replace(state.helper_started_unix_ms)
+                            .is_some_and(|previous| previous != state.helper_started_unix_ms);
+                        if pending_command
+                            .as_ref()
+                            .is_some_and(|(id, _, _)| state.acknowledged_command_id >= *id)
+                        {
+                            pending_command = None;
+                        }
+                        let state_matches_desired = if desired_running {
+                            state.snapshot.state == ToolState::Running
+                        } else {
+                            state.snapshot.state == ToolState::Stopped
+                        };
+                        if !desired_state_satisfied && state_matches_desired {
+                            desired_state_satisfied = true;
+                        }
+                        if helper_changed {
+                            desired_state_satisfied = false;
+                            let command = if desired_running {
+                                ElevatedCommand::Start
+                            } else {
+                                ElevatedCommand::Stop
+                            };
+                            pending_command = queue_elevated_command(
+                                &state_directory,
+                                &config.name,
+                                command,
+                                &log,
+                            );
+                            last_desired_issue = Some(Instant::now());
+                            log.write(
+                                "manager",
+                                "elevated helper restarted; desired state was reissued",
+                            );
+                        } else if helper_first_seen
+                            && !state_matches_desired
+                            && pending_command.is_none()
+                        {
+                            let command = if desired_running {
+                                ElevatedCommand::Start
+                            } else {
+                                ElevatedCommand::Stop
+                            };
+                            pending_command = queue_elevated_command(
+                                &state_directory,
+                                &config.name,
+                                command,
+                                &log,
+                            );
+                            last_desired_issue = Some(Instant::now());
+                        } else if let Some((id, command, sent_at)) = pending_command
+                            && state.acknowledged_command_id < id
+                            && sent_at.elapsed() >= Duration::from_secs(2)
+                        {
+                            match resend_command(
+                                &state_directory,
+                                &config.name,
+                                id,
+                                command,
+                            ) {
+                                Ok(()) => {
+                                    let issued = Instant::now();
+                                    pending_command = Some((id, command, issued));
+                                    last_desired_issue = Some(issued);
+                                    log.write(
+                                        "manager",
+                                        "elevated command was not acknowledged; command was reissued",
+                                    );
+                                }
+                                Err(error) => {
+                                    let issued = Instant::now();
+                                    pending_command = Some((id, command, issued));
+                                    last_desired_issue = Some(issued);
+                                    log.write(
+                                        "manager",
+                                        &format!("failed to reissue elevated command: {error:#}"),
+                                    );
+                                }
+                            }
+                        }
+                        if pending_command.is_none()
+                            && !desired_state_satisfied
+                            && !state_matches_desired
+                            && last_desired_issue
+                                .is_none_or(|issued| issued.elapsed() >= Duration::from_secs(8))
+                        {
+                            let command = if desired_running {
+                                ElevatedCommand::Start
+                            } else {
+                                ElevatedCommand::Stop
+                            };
+                            pending_command = queue_elevated_command(
+                                &state_directory,
+                                &config.name,
+                                command,
+                                &log,
+                            );
+                            last_desired_issue = Some(Instant::now());
+                            log.write(
+                                "manager",
+                                "elevated state did not reach the requested value; desired state was reconciled",
+                            );
+                        }
                         let mut current = runtime.lock().unwrap();
                         current.state = state.snapshot.state;
                         current.pid = state.snapshot.pid;
@@ -638,7 +794,26 @@ fn spawn_elevated_proxy_worker(
                         current.restart_count = state.snapshot.restart_count;
                         current.started_at_unix_ms = state.snapshot.started_at_unix_ms;
                     }
-                    Ok(_) | Err(_) => {
+                    Ok(_) => {
+                        let since = unavailable_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_secs(8) {
+                            let mut current = runtime.lock().unwrap();
+                            current.state = if desired_running {
+                                ToolState::Crashed
+                            } else {
+                                ToolState::Stopped
+                            };
+                            current.pid = None;
+                            current.memory = MemoryValue::Unavailable;
+                            current.started_at_unix_ms = None;
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("failed to read elevated helper state: {error:#}");
+                        if last_state_error.as_deref() != Some(message.as_str()) {
+                            log.write("manager", &message);
+                            last_state_error = Some(message);
+                        }
                         let since = unavailable_since.get_or_insert_with(Instant::now);
                         if since.elapsed() >= Duration::from_secs(8) {
                             let mut current = runtime.lock().unwrap();
@@ -656,6 +831,25 @@ fn spawn_elevated_proxy_worker(
             }
         })
         .expect("failed to create elevated proxy thread")
+}
+
+#[cfg(windows)]
+fn queue_elevated_command(
+    state_directory: &Path,
+    tool_name: &str,
+    command: crate::core::elevated::ElevatedCommand,
+    log: &ToolLog,
+) -> Option<(u64, crate::core::elevated::ElevatedCommand, Instant)> {
+    match crate::core::elevated::send_command(state_directory, tool_name, command) {
+        Ok(id) => Some((id, command, Instant::now())),
+        Err(error) => {
+            log.write(
+                "manager",
+                &format!("failed to queue elevated command: {error:#}"),
+            );
+            None
+        }
+    }
 }
 
 fn start_process(
@@ -685,7 +879,9 @@ fn start_process(
     if let Err(error) = guard.attach(&child) {
         let _ = guard.force_stop();
         let _ = child.kill();
-        let _ = child.wait();
+        if wait_for_child_exit(&mut child, Duration::from_secs(2)).is_none() {
+            spawn_child_reaper(child);
+        }
         return Err(error);
     }
     let pid = child.id();
@@ -707,14 +903,29 @@ fn start_process(
 }
 
 fn stop_remaining_process_tree(guard: &dyn ProcessGuard, log: &ToolLog, timeout: Duration) {
-    if !guard.is_tree_running().unwrap_or(false) {
-        return;
+    match guard.is_tree_running() {
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(error) => log.write(
+            "manager",
+            &format!("failed to query remaining process tree: {error:#}"),
+        ),
     }
     log.write(
         "manager",
         "root process exited; stopping remaining process tree",
     );
-    if guard.request_graceful_stop().unwrap_or(false) {
+    let graceful = match guard.request_graceful_stop() {
+        Ok(graceful) => graceful,
+        Err(error) => {
+            log.write(
+                "manager",
+                &format!("failed to request graceful process-tree stop: {error:#}"),
+            );
+            false
+        }
+    };
+    if graceful {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if !guard.is_tree_running().unwrap_or(true) {
@@ -740,15 +951,18 @@ fn spawn_reader(
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut bytes = Vec::new();
         loop {
-            bytes.clear();
-            match reader.read_until(b'\n', &mut bytes) {
-                Ok(0) => break,
-                Ok(_) => log.write(
-                    channel,
-                    String::from_utf8_lossy(&bytes).trim_end_matches(['\r', '\n']),
-                ),
+            match read_capped_line(&mut reader, log.max_line_bytes()) {
+                Ok(None) => break,
+                Ok(Some((bytes, truncated))) => {
+                    let mut text = String::from_utf8_lossy(&bytes)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned();
+                    if truncated {
+                        text.push_str(" …[output line truncated]");
+                    }
+                    log.write(channel, &text);
+                }
                 Err(error) => {
                     log.write("manager", &format!("{channel} read failed: {error}"));
                     break;
@@ -758,13 +972,48 @@ fn spawn_reader(
     });
 }
 
+fn read_capped_line(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+    let mut output = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut truncated = false;
+    let mut observed = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if observed {
+                Ok(Some((output, truncated)))
+            } else {
+                Ok(None)
+            };
+        }
+        observed = true;
+        let end = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        let available = max_bytes.saturating_sub(output.len());
+        let copied = end.min(available);
+        output.extend_from_slice(&buffer[..copied]);
+        if copied < end {
+            truncated = true;
+        }
+        let found_newline = buffer.get(end.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(end);
+        if found_newline {
+            return Ok(Some((output, truncated)));
+        }
+    }
+}
+
 fn stop_process(
     process: &mut Option<ManagedProcess>,
     runtime: &Arc<Mutex<Runtime>>,
     log: &Arc<ToolLog>,
     timeout: Duration,
 ) {
-    let Some(active) = process.as_mut() else {
+    let Some(mut active) = process.take() else {
         let mut state = runtime.lock().unwrap();
         state.state = ToolState::Stopped;
         state.pid = None;
@@ -773,7 +1022,16 @@ fn stop_process(
         return;
     };
     runtime.lock().unwrap().state = ToolState::Stopping;
-    let graceful = active.guard.request_graceful_stop().unwrap_or(false);
+    let graceful = match active.guard.request_graceful_stop() {
+        Ok(graceful) => graceful,
+        Err(error) => {
+            log.write(
+                "manager",
+                &format!("failed to request graceful stop: {error:#}"),
+            );
+            false
+        }
+    };
     if graceful {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -785,6 +1043,7 @@ fn stop_process(
         }
     }
     let _ = active.child.try_wait();
+    let mut force_failed = false;
     if active.guard.is_tree_running().unwrap_or(true) {
         log.write(
             "manager",
@@ -792,16 +1051,55 @@ fn stop_process(
         );
         if let Err(error) = active.guard.force_stop() {
             log.write("manager", &format!("force stop failed: {error:#}"));
+            force_failed = true;
         }
     }
-    let _ = active.child.wait();
-    *process = None;
+    let reap_timeout = Duration::from_secs(2);
+    if (force_failed || wait_for_child_exit(&mut active.child, reap_timeout).is_none())
+        && let Err(error) = active.child.kill()
+        && active.child.try_wait().ok().flatten().is_none()
+    {
+        log.write(
+            "manager",
+            &format!("direct child kill fallback failed: {error}"),
+        );
+    }
+    if wait_for_child_exit(&mut active.child, reap_timeout).is_none() {
+        log.write(
+            "manager",
+            "child did not exit within the reap deadline; detached reaper will collect it",
+        );
+        let ManagedProcess { child, guard } = active;
+        drop(guard);
+        spawn_child_reaper(child);
+    }
     let mut state = runtime.lock().unwrap();
     state.state = ToolState::Stopped;
     state.pid = None;
     state.memory = MemoryValue::Idle;
     state.started_at_unix_ms = None;
     log.write("manager", "process stopped");
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or(Instant::now());
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+fn spawn_child_reaper(mut child: Child) {
+    let _ = thread::Builder::new()
+        .name("managed-child-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 fn unix_ms() -> u64 {
@@ -861,4 +1159,77 @@ fn schedule_tool_memory_refresh(
                 current.memory = value;
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_reader_discards_the_remainder_of_an_oversized_line() {
+        let input = b"abcdefghijklmnopqrstuvwxyz\nnext\n";
+        let mut reader = BufReader::new(&input[..]);
+        let (first, truncated) = read_capped_line(&mut reader, 8).unwrap().unwrap();
+        let (second, second_truncated) = read_capped_line(&mut reader, 8).unwrap().unwrap();
+
+        assert_eq!(first, b"abcdefgh");
+        assert!(truncated);
+        assert_eq!(second, b"next\n");
+        assert!(!second_truncated);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_tree_stop_cannot_block_child_reaping_forever() {
+        struct FailingGuard;
+
+        impl ProcessGuard for FailingGuard {
+            fn attach(&mut self, _child: &Child) -> Result<()> {
+                Ok(())
+            }
+
+            fn request_graceful_stop(&self) -> Result<bool> {
+                Ok(false)
+            }
+
+            fn is_tree_running(&self) -> Result<bool> {
+                Ok(true)
+            }
+
+            fn force_stop(&self) -> Result<()> {
+                anyhow::bail!("injected force-stop failure")
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "winkeeper-stop-test-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let log = Arc::new(
+            ToolLog::new(&directory, "stop-test", 100, 64 * 1024, 1024 * 1024, 4096).unwrap(),
+        );
+        let runtime = Arc::new(Mutex::new(Runtime {
+            state: ToolState::Running,
+            pid: None,
+            memory: MemoryValue::Idle,
+            restart_count: 0,
+            started_at_unix_ms: None,
+        }));
+        let child = Command::new("/usr/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        runtime.lock().unwrap().pid = Some(pid);
+        let mut process = Some(ManagedProcess {
+            child,
+            guard: Box::new(FailingGuard),
+        });
+        let started = Instant::now();
+
+        stop_process(&mut process, &runtime, &log, Duration::from_millis(100));
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(process.is_none());
+        assert_eq!(runtime.lock().unwrap().state, ToolState::Stopped);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

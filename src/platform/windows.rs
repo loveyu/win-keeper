@@ -7,9 +7,10 @@ use std::{
     mem::{size_of, zeroed},
     os::windows::{ffi::OsStrExt, io::AsRawHandle, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     ptr::{null, null_mut},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE},
@@ -44,6 +45,15 @@ pub struct WindowsAdapter;
 
 struct JobObject {
     handle: HANDLE,
+    root_pid: u32,
+    graceful_stop: Option<GracefulStop>,
+    stop_timeout: Duration,
+}
+
+struct GracefulStop {
+    command: String,
+    args: Vec<String>,
+    workdir: Option<String>,
 }
 
 unsafe impl Send for JobObject {}
@@ -53,7 +63,7 @@ impl PlatformAdapter for WindowsAdapter {
         &self,
         command: &mut Command,
         config: &ToolConfig,
-        _stop_timeout: Duration,
+        stop_timeout: Duration,
     ) -> Result<Box<dyn ProcessGuard>> {
         if config.admin {
             bail!(
@@ -61,7 +71,7 @@ impl PlatformAdapter for WindowsAdapter {
             );
         }
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_SUSPENDED);
-        Ok(Box::new(JobObject::new()?))
+        Ok(Box::new(JobObject::new(config, stop_timeout)?))
     }
 
     fn memory_usage(&self, pid: u32) -> Result<u64> {
@@ -106,12 +116,16 @@ impl PlatformAdapter for WindowsAdapter {
                 pid: entry.th32ProcessID,
                 parent_pid: entry.th32ParentProcessID,
                 name: String::from_utf16_lossy(&entry.szExeFile[..name_len]),
-                memory_bytes: self.memory_usage(entry.th32ProcessID).ok(),
+                memory_bytes: None,
             });
             has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
         }
         unsafe { CloseHandle(snapshot) };
-        Ok(build_process_tree(root_pid, processes))
+        let mut tree = build_process_tree(root_pid, processes);
+        for process in &mut tree {
+            process.memory_bytes = self.memory_usage(process.pid).ok();
+        }
+        Ok(tree)
     }
 
     fn open_path(&self, path: &Path) -> Result<()> {
@@ -135,7 +149,7 @@ impl PlatformAdapter for WindowsAdapter {
 }
 
 impl JobObject {
-    fn new() -> Result<Self> {
+    fn new(config: &ToolConfig, stop_timeout: Duration) -> Result<Self> {
         let handle = unsafe { CreateJobObjectW(null(), null()) };
         if handle.is_null() {
             return Err(std::io::Error::last_os_error()).context("CreateJobObjectW failed");
@@ -154,7 +168,20 @@ impl JobObject {
             unsafe { CloseHandle(handle) };
             return Err(std::io::Error::last_os_error()).context("SetInformationJobObject failed");
         }
-        Ok(Self { handle })
+        let graceful_stop = config
+            .graceful_stop_command
+            .as_ref()
+            .map(|command| GracefulStop {
+                command: command.clone(),
+                args: config.graceful_stop_args.clone(),
+                workdir: config.workdir.clone(),
+            });
+        Ok(Self {
+            handle,
+            root_pid: 0,
+            graceful_stop,
+            stop_timeout,
+        })
     }
 }
 
@@ -166,11 +193,55 @@ impl ProcessGuard for JobObject {
         }
         resume_process(child.id())
             .context("failed to resume process after Job Object attachment")?;
+        self.root_pid = child.id();
         Ok(())
     }
 
     fn request_graceful_stop(&self) -> Result<bool> {
-        Ok(false)
+        let Some(stop) = &self.graceful_stop else {
+            return Ok(false);
+        };
+        let mut command = Command::new(&stop.command);
+        command
+            .args(&stop.args)
+            .env("WINKEEPER_PID", self.root_pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        if let Some(workdir) = &stop.workdir {
+            command.current_dir(workdir);
+        }
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to execute graceful stop command {}", stop.command))?;
+        let timeout = self.stop_timeout.min(Duration::from_secs(10));
+        let _ = thread::Builder::new()
+            .name("graceful-stop-reaper".into())
+            .spawn(move || {
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or(Instant::now());
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        Ok(None) => {
+                            let _ = child.kill();
+                            let kill_deadline = Instant::now() + Duration::from_secs(2);
+                            while child.try_wait().ok().flatten().is_none()
+                                && Instant::now() < kill_deadline
+                            {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        Ok(true)
     }
 
     fn is_tree_running(&self) -> Result<bool> {
@@ -258,6 +329,10 @@ pub fn paths(config_override: Option<PathBuf>) -> Result<AppPaths> {
         log_directory: root.join("logs"),
         state_directory: root,
     })
+}
+
+pub fn secure_paths(_paths: &AppPaths) -> Result<()> {
+    Ok(())
 }
 
 pub fn configure_autostart(enabled: bool, config_file: &Path) -> Result<()> {
@@ -352,6 +427,38 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         guard.attach(&child).unwrap();
         assert!(child.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while guard.is_tree_running().unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(!guard.is_tree_running().unwrap());
+    }
+
+    #[test]
+    fn configured_graceful_stop_hook_is_executed_before_job_termination() {
+        let adapter = WindowsAdapter;
+        let config = ToolConfig {
+            name: "graceful-stop-test".into(),
+            command: "cmd.exe".into(),
+            args: vec!["/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+            graceful_stop_command: Some("cmd.exe".into()),
+            graceful_stop_args: vec!["/C".into(), "exit 0".into()],
+            ..ToolConfig::default()
+        };
+        let mut command = Command::new(&config.command);
+        command
+            .args(&config.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut guard = adapter
+            .prepare_command(&mut command, &config, Duration::from_secs(1))
+            .unwrap();
+        let mut child = command.spawn().unwrap();
+        guard.attach(&child).unwrap();
+
+        assert!(guard.request_graceful_stop().unwrap());
+        guard.force_stop().unwrap();
+        let _ = child.wait().unwrap();
     }
 }

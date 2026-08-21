@@ -63,6 +63,7 @@ fn run() -> Result<()> {
 
     let config_override = args.config;
     let paths = platform::paths(config_override)?;
+    platform::secure_paths(&paths)?;
     let config = AppConfig::load_or_create(&paths.config_file)
         .with_context(|| format!("failed to load {}", paths.config_file.display()))?;
 

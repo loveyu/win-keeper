@@ -31,12 +31,17 @@ pub(crate) enum ElevatedCommand {
 
 #[derive(Deserialize, Serialize)]
 struct CommandRequest {
+    id: u64,
     command: ElevatedCommand,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct ElevatedState {
     pub snapshot: ToolSnapshot,
+    #[serde(default)]
+    pub acknowledged_command_id: u64,
+    #[serde(default)]
+    pub helper_started_unix_ms: u64,
     updated_unix_ms: u64,
 }
 
@@ -78,47 +83,85 @@ pub fn run_helper(manifest: &Path, state_directory: &Path) -> Result<()> {
     let control_directory = elevated_root(state_directory).join("control");
     fs::create_dir_all(&control_directory)?;
     recover_claimed_commands(&control_directory);
+    let helper_started_unix_ms = next_command_id();
+    let mut acknowledged = names
+        .iter()
+        .map(|name| {
+            let id = read_state(state_directory, name)
+                .ok()
+                .flatten()
+                .map_or(0, |state| state.acknowledged_command_id);
+            (tool_key(name), id)
+        })
+        .collect::<HashMap<_, _>>();
     let mut last_snapshots = Vec::new();
     let mut last_publish = Instant::now() - Duration::from_secs(3);
 
     loop {
-        if let Ok(entries) = fs::read_dir(&control_directory) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("command") {
-                    continue;
-                }
-                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                let Some((key, _)) = file_name.split_once('.') else {
-                    continue;
-                };
-                let Some(&index) = index_by_key.get(key) else {
-                    continue;
-                };
-                let claimed = path.with_extension(format!("processing-{}", std::process::id()));
-                if fs::rename(&path, &claimed).is_err() {
-                    continue;
-                }
-                let request = fs::read_to_string(&claimed)
-                    .ok()
-                    .and_then(|raw| toml::from_str::<CommandRequest>(&raw).ok());
-                let _ = fs::remove_file(&claimed);
-                match request.map(|request| request.command) {
-                    Some(ElevatedCommand::Start) => supervisor.start(index),
-                    Some(ElevatedCommand::Stop) => supervisor.stop(index),
-                    Some(ElevatedCommand::Restart) => supervisor.restart(index),
-                    Some(ElevatedCommand::SampleMemory) => supervisor.sample_memory(),
-                    None => {}
-                }
+        let mut acknowledged_changed = false;
+        let mut paths = fs::read_dir(&control_directory)
+            .context("failed to enumerate elevated command queue")?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("command"))
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| command_file_id(path).unwrap_or(u64::MAX));
+        for path in paths {
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some((key, _)) = file_name.split_once('.') else {
+                continue;
+            };
+            let claimed = path.with_extension(format!("processing-{}", std::process::id()));
+            if fs::rename(&path, &claimed).is_err() {
+                continue;
             }
+            let request = fs::read_to_string(&claimed)
+                .ok()
+                .and_then(|raw| toml::from_str::<CommandRequest>(&raw).ok());
+            let Some(request) = request else {
+                reject_command(&control_directory, &claimed, "invalid");
+                continue;
+            };
+            if command_file_id(&path) != Some(request.id) {
+                reject_command(&control_directory, &claimed, "id-mismatch");
+                continue;
+            }
+            let Some(&index) = index_by_key.get(key) else {
+                reject_command(&control_directory, &claimed, "unknown-tool");
+                continue;
+            };
+            let last_acknowledged = acknowledged.get(key).copied().unwrap_or(0);
+            if request.id <= last_acknowledged {
+                let _ = fs::remove_file(&claimed);
+                continue;
+            }
+            match request.command {
+                ElevatedCommand::Start => supervisor.start(index),
+                ElevatedCommand::Stop => supervisor.stop(index),
+                ElevatedCommand::Restart => supervisor.restart(index),
+                ElevatedCommand::SampleMemory => supervisor.sample_memory(),
+            }
+            acknowledged.insert(key.to_owned(), request.id);
+            acknowledged_changed = true;
+            let _ = fs::remove_file(&claimed);
         }
 
         let snapshots = supervisor.snapshots();
-        if snapshots != last_snapshots || last_publish.elapsed() >= Duration::from_secs(2) {
+        if acknowledged_changed
+            || snapshots != last_snapshots
+            || last_publish.elapsed() >= Duration::from_secs(2)
+        {
             for snapshot in &snapshots {
-                publish_state(state_directory, snapshot)?;
+                publish_state(
+                    state_directory,
+                    snapshot,
+                    acknowledged
+                        .get(&tool_key(&snapshot.name))
+                        .copied()
+                        .unwrap_or(0),
+                    helper_started_unix_ms,
+                )?;
             }
             last_snapshots = snapshots;
             last_publish = Instant::now();
@@ -131,16 +174,48 @@ pub(crate) fn send_command(
     state_directory: &Path,
     tool_name: &str,
     command: ElevatedCommand,
+) -> Result<u64> {
+    let minimum = read_state(state_directory, tool_name)
+        .ok()
+        .flatten()
+        .map_or(0, |state| state.acknowledged_command_id.saturating_add(1));
+    let id = next_command_id().max(minimum);
+    write_command(state_directory, tool_name, id, command)?;
+    Ok(id)
+}
+
+pub(crate) fn resend_command(
+    state_directory: &Path,
+    tool_name: &str,
+    id: u64,
+    command: ElevatedCommand,
+) -> Result<()> {
+    write_command(state_directory, tool_name, id, command)
+}
+
+fn write_command(
+    state_directory: &Path,
+    tool_name: &str,
+    id: u64,
+    command: ElevatedCommand,
 ) -> Result<()> {
     let directory = elevated_root(state_directory).join("control");
     fs::create_dir_all(&directory)?;
-    let nonce = unix_ms()
-        .saturating_mul(1_000)
-        .saturating_add(COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed) % 1_000);
-    let path = directory.join(format!("{}.{nonce}.command", tool_key(tool_name)));
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temporary, toml::to_string(&CommandRequest { command })?)?;
-    fs::rename(temporary, path)?;
+    let path = directory.join(format!("{}.{id}.command", tool_key(tool_name)));
+    if path.exists() {
+        return Ok(());
+    }
+    let temporary = path.with_extension(format!("tmp-{}-{id}", std::process::id()));
+    fs::write(
+        &temporary,
+        toml::to_string(&CommandRequest { id, command })?,
+    )?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        if !path.exists() {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 
@@ -153,7 +228,12 @@ pub(crate) fn read_state(state_directory: &Path, tool_name: &str) -> Result<Opti
     }
 }
 
-fn publish_state(state_directory: &Path, snapshot: &ToolSnapshot) -> Result<()> {
+fn publish_state(
+    state_directory: &Path,
+    snapshot: &ToolSnapshot,
+    acknowledged_command_id: u64,
+    helper_started_unix_ms: u64,
+) -> Result<()> {
     let directory = elevated_root(state_directory);
     fs::create_dir_all(&directory)?;
     let target = directory.join(format!("{}.state.toml", tool_key(&snapshot.name)));
@@ -164,12 +244,34 @@ fn publish_state(state_directory: &Path, snapshot: &ToolSnapshot) -> Result<()> 
     ));
     let state = ElevatedState {
         snapshot: snapshot.clone(),
+        acknowledged_command_id,
+        helper_started_unix_ms,
         updated_unix_ms: unix_ms(),
     };
     fs::write(&temporary, toml::to_string(&state)?)?;
     let _ = fs::remove_file(&target);
     fs::rename(temporary, target)?;
     Ok(())
+}
+
+fn command_file_id(path: &Path) -> Option<u64> {
+    path.file_name()?.to_str()?.split('.').nth(1)?.parse().ok()
+}
+
+fn reject_command(control_directory: &Path, claimed: &Path, reason: &str) {
+    let rejected = control_directory.join("rejected");
+    if fs::create_dir_all(&rejected).is_err() {
+        let _ = fs::remove_file(claimed);
+        return;
+    }
+    let file_name = claimed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown-command");
+    let target = rejected.join(format!("{file_name}.{reason}"));
+    if fs::rename(claimed, target).is_err() {
+        let _ = fs::remove_file(claimed);
+    }
 }
 
 fn recover_claimed_commands(directory: &Path) {
@@ -187,6 +289,8 @@ fn recover_claimed_commands(directory: &Path) {
         let command = path.with_extension("command");
         if !command.exists() {
             let _ = fs::rename(path, command);
+        } else {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -220,6 +324,12 @@ fn unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn next_command_id() -> u64 {
+    unix_ms()
+        .saturating_mul(1_000)
+        .saturating_add(COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed) % 1_000)
 }
 
 #[allow(dead_code)]
@@ -263,7 +373,7 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&state_directory);
-        send_command(&state_directory, "Admin Tool", ElevatedCommand::Restart).unwrap();
+        let id = send_command(&state_directory, "Admin Tool", ElevatedCommand::Restart).unwrap();
         let control = elevated_root(&state_directory).join("control");
         let files = fs::read_dir(&control)
             .unwrap()
@@ -277,7 +387,45 @@ mod tests {
         );
         let request: CommandRequest =
             toml::from_str(&fs::read_to_string(&files[0]).unwrap()).unwrap();
+        assert_eq!(request.id, id);
+        assert_eq!(command_file_id(&files[0]), Some(id));
         assert_eq!(request.command, ElevatedCommand::Restart);
         fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[test]
+    fn command_files_sort_by_monotonic_id() {
+        let key = tool_key("Admin Tool");
+        let mut paths = [
+            PathBuf::from(format!("{key}.30.command")),
+            PathBuf::from(format!("{key}.2.command")),
+            PathBuf::from(format!("{key}.11.command")),
+        ];
+        paths.sort_by_key(|path| command_file_id(path).unwrap());
+
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| command_file_id(path).unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 11, 30]
+        );
+    }
+
+    #[test]
+    fn legacy_state_defaults_protocol_metadata() {
+        let raw = r#"
+updated_unix_ms = 1
+
+[snapshot]
+name = "Admin Tool"
+state = "stopped"
+memory = { kind = "idle" }
+restart_count = 0
+"#;
+        let state: ElevatedState = toml::from_str(raw).unwrap();
+
+        assert_eq!(state.acknowledged_command_id, 0);
+        assert_eq!(state.helper_started_unix_ms, 0);
     }
 }

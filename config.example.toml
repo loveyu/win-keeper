@@ -3,6 +3,9 @@ lang = "zh_CN"
 start_with_system = true
 minimize_to_tray = true
 log_buffer_lines = 10000
+log_buffer_bytes = 2097152
+log_file_max_bytes = 10485760
+log_line_max_bytes = 65536
 stop_timeout_ms = 30000
 
 [[tools]]
@@ -10,6 +13,9 @@ name = "example-worker"
 command = "C:\\Tools\\example-worker.exe"
 args = ["--config", "config.toml"]
 workdir = "C:\\Tools"
+# Optional graceful shutdown hook. WINKEEPER_PID contains the managed root PID.
+# graceful_stop_command = "C:\\Tools\\example-worker-control.exe"
+# graceful_stop_args = ["stop"]
 admin = false
 auto_start = true
 auto_restart = true

@@ -20,14 +20,18 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicI32, AtomicU64, Ordering},
-        mpsc,
+        Arc,
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError},
     },
     thread,
     time::{Duration, Instant},
 };
 
 static SCOPE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const SYSTEMD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCHDOG_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct LinuxAdapter {
     systemd: Option<SystemdSupport>,
@@ -37,6 +41,7 @@ pub struct LinuxAdapter {
 struct SystemdSupport {
     run: PathBuf,
     ctl: PathBuf,
+    enabled: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -75,6 +80,7 @@ impl SystemdSupport {
         let support = Self {
             run: find_executable("systemd-run")?,
             ctl: find_executable("systemctl")?,
+            enabled: Arc::new(AtomicBool::new(true)),
         };
         let mut command = Command::new(&support.ctl);
         command
@@ -83,8 +89,7 @@ impl SystemdSupport {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         unblock_shutdown_signals(&mut command);
-        command
-            .status()
+        command_status_with_timeout(&mut command, SYSTEMD_COMMAND_TIMEOUT)
             .ok()
             .filter(|status| status.success())
             .map(|_| support)
@@ -103,15 +108,19 @@ impl PlatformAdapter for LinuxAdapter {
         }
         use std::os::unix::process::CommandExt;
         let manager_pid = getpid();
-        let scope = self.systemd.as_ref().map(|support| {
-            let unit = next_scope_unit("tool");
-            wrap_command_in_scope(command, support, &unit, &config.name);
-            SystemdScope {
-                unit,
-                cgroup: None,
-                support: support.clone(),
-            }
-        });
+        let scope = self
+            .systemd
+            .as_ref()
+            .filter(|support| support.enabled.load(Ordering::Acquire))
+            .map(|support| {
+                let unit = next_scope_unit("tool");
+                wrap_command_in_scope(command, support, &unit, &config.name);
+                SystemdScope {
+                    unit,
+                    cgroup: None,
+                    support: support.clone(),
+                }
+            });
         command.process_group(0);
         // The manager blocks shutdown signals for its sigwait thread; children must not inherit it.
         // PDEATHSIG covers the short window before the process-group watchdog is attached.
@@ -203,14 +212,14 @@ impl PlatformAdapter for LinuxAdapter {
                 pid,
                 parent_pid,
                 name: command,
-                memory_bytes: self.memory_usage(pid).ok(),
+                memory_bytes: None,
             });
         }
-        Ok(build_process_tree_with_members(
-            root_pid,
-            processes,
-            managed_members,
-        ))
+        let mut tree = build_process_tree_with_members(root_pid, processes, managed_members);
+        for process in &mut tree {
+            process.memory_bytes = self.memory_usage(process.pid).ok();
+        }
+        Ok(tree)
     }
 
     fn open_path(&self, path: &Path) -> Result<()> {
@@ -237,10 +246,93 @@ fn spawn_reaped(command: &mut Command, thread_name: &str) -> Result<u32> {
     if let Err(error) = sender.send(child) {
         let mut child = error.0;
         let _ = child.kill();
-        let _ = child.wait();
+        if wait_for_child_exit(&mut child, CHILD_REAP_TIMEOUT).is_none() {
+            spawn_child_reaper(child, "failed-child-reaper");
+        }
         bail!("child reaper stopped unexpectedly");
     }
     Ok(pid)
+}
+
+fn command_status_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let mut child = command.spawn()?;
+    match wait_for_child_exit(&mut child, timeout) {
+        Some(status) => Ok(status),
+        None => {
+            terminate_timed_out_child(child, "timed-command-reaper");
+            bail!("command timed out after {} ms", timeout.as_millis())
+        }
+    }
+}
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    command.stdout(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("command stdout is unavailable")?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("timed-command-output".into())
+        .spawn(move || {
+            let result = read_capped_output(&mut stdout, 64 * 1024);
+            let _ = sender.send(result);
+        })
+        .context("failed to start command output reader")?;
+    let Some(status) = wait_for_child_exit(&mut child, timeout) else {
+        terminate_timed_out_child(child, "timed-output-command-reaper");
+        bail!("command timed out after {} ms", timeout.as_millis());
+    };
+    let stdout = receiver
+        .recv_timeout(CHILD_REAP_TIMEOUT)
+        .context("timed out collecting command output")??;
+    Ok((status, stdout))
+}
+
+fn read_capped_output(reader: &mut impl Read, capacity: usize) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(capacity.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let remaining = capacity.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+fn terminate_timed_out_child(mut child: Child, reaper_name: &str) {
+    let _ = child.kill();
+    if wait_for_child_exit(&mut child, CHILD_REAP_TIMEOUT).is_none() {
+        spawn_child_reaper(child, reaper_name);
+    }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or(Instant::now());
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+fn spawn_child_reaper(mut child: Child, name: &str) {
+    let _ = thread::Builder::new().name(name.into()).spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 impl ProcessGuard for ProcessGroup {
@@ -248,12 +340,20 @@ impl ProcessGuard for ProcessGroup {
         let pgid = child.id() as i32;
         self.pgid.store(pgid, Ordering::Release);
         if let Some(scope) = self.scope.as_mut() {
-            scope.cgroup = Some(wait_for_scope_cgroup(
+            match wait_for_scope_cgroup(
                 &scope.support,
                 &scope.unit,
                 child.id(),
                 Duration::from_secs(3),
-            )?);
+            ) {
+                Ok(cgroup) => scope.cgroup = Some(cgroup),
+                Err(error) => {
+                    scope.support.enabled.store(false, Ordering::Release);
+                    return Err(error).context(
+                        "systemd scope launch failed; subsequent starts will use process groups",
+                    );
+                }
+            }
         }
         self.watchdog = Some(spawn_watchdog(
             pgid,
@@ -261,6 +361,33 @@ impl ProcessGuard for ProcessGroup {
             self.scope.as_ref(),
         )?);
         Ok(())
+    }
+
+    fn check_health(&mut self) -> Result<()> {
+        let Some(watchdog) = self.watchdog.as_mut() else {
+            if self.is_tree_running().unwrap_or(true) {
+                self.watchdog = Some(spawn_watchdog(
+                    self.pgid.load(Ordering::Acquire),
+                    self.stop_timeout,
+                    self.scope.as_ref(),
+                )?);
+                bail!("process watchdog was unavailable and was recreated");
+            }
+            return Ok(());
+        };
+        let Some(status) = watchdog.child.try_wait()? else {
+            return Ok(());
+        };
+        self.watchdog = None;
+        if self.is_tree_running().unwrap_or(true) {
+            self.watchdog = Some(spawn_watchdog(
+                self.pgid.load(Ordering::Acquire),
+                self.stop_timeout,
+                self.scope.as_ref(),
+            )?);
+            bail!("process watchdog exited with {status} and was restarted");
+        }
+        bail!("process watchdog exited with {status}")
     }
 
     fn request_graceful_stop(&self) -> Result<bool> {
@@ -275,8 +402,9 @@ impl ProcessGuard for ProcessGroup {
     fn is_tree_running(&self) -> Result<bool> {
         if let Some(scope) = &self.scope
             && let Some(cgroup) = &scope.cgroup
+            && cgroup_populated(cgroup)?
         {
-            return cgroup_populated(cgroup);
+            return Ok(true);
         }
         let pgid = self.pgid.load(Ordering::Acquire);
         if pgid <= 0 {
@@ -303,10 +431,23 @@ impl Drop for ProcessGroup {
         let Some(mut watchdog) = self.watchdog.take() else {
             return;
         };
-        if let Some(mut control) = watchdog.control.take() {
-            let _ = control.write_all(b"D");
+        if self.is_tree_running().unwrap_or(true) {
+            drop(watchdog.control.take());
+            spawn_child_reaper(watchdog.child, "watchdog-tree-cleanup-reaper");
+            return;
         }
-        let _ = watchdog.child.wait();
+        if let Some(mut control) = watchdog.control.take()
+            && control.write_all(b"D").is_err()
+        {
+            drop(control);
+        }
+        if wait_for_child_exit(&mut watchdog.child, CHILD_REAP_TIMEOUT).is_none() {
+            let _ = killpg(Pid::from_raw(watchdog.child.id() as i32), Signal::SIGKILL);
+            let _ = watchdog.child.kill();
+            if wait_for_child_exit(&mut watchdog.child, CHILD_REAP_TIMEOUT).is_none() {
+                spawn_child_reaper(watchdog.child, "watchdog-reaper");
+            }
+        }
     }
 }
 
@@ -367,12 +508,27 @@ fn spawn_watchdog(
         .stdout
         .take()
         .context("process watchdog readiness pipe is unavailable")?;
-    let mut ready = [0_u8; 1];
-    if ready_pipe.read_exact(&mut ready).is_err() || ready[0] != b'R' {
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("watchdog-ready-reader".into())
+        .spawn(move || {
+            let mut ready = [0_u8; 1];
+            let result = ready_pipe.read_exact(&mut ready).map(|_| ready[0]);
+            let _ = ready_sender.send(result);
+        })
+        .context("failed to start watchdog readiness reader")?;
+    let ready = ready_receiver.recv_timeout(WATCHDOG_READY_TIMEOUT);
+    if !matches!(ready, Ok(Ok(b'R'))) {
         drop(control);
+        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
         let _ = child.kill();
-        let _ = child.wait();
-        bail!("process watchdog failed to become ready");
+        if wait_for_child_exit(&mut child, CHILD_REAP_TIMEOUT).is_none() {
+            spawn_child_reaper(child, "failed-watchdog-reaper");
+        }
+        match ready {
+            Err(RecvTimeoutError::Timeout) => bail!("process watchdog readiness timed out"),
+            _ => bail!("process watchdog failed to become ready"),
+        }
     }
     Ok(Watchdog {
         child,
@@ -397,6 +553,7 @@ pub fn run_process_watchdog(
             support: SystemdSupport {
                 run: PathBuf::new(),
                 ctl,
+                enabled: Arc::new(AtomicBool::new(true)),
             },
         }),
         (None, None, None) => None,
@@ -455,17 +612,17 @@ fn process_group_running(pgid: i32) -> bool {
 fn signal_managed_tree(pgid: i32, scope: Option<&SystemdScope>, signal: Signal) -> Result<()> {
     let mut delivered = false;
     let mut errors = Vec::new();
-    if let Some(scope) = scope {
-        match signal_scope(scope, signal) {
-            Ok(()) => delivered = true,
-            Err(error) => errors.push(format!("scope {}: {error:#}", scope.unit)),
-        }
-    }
     if pgid > 0 {
         match killpg(Pid::from_raw(pgid), signal) {
             Ok(()) => delivered = true,
             Err(Errno::ESRCH) => {}
             Err(error) => errors.push(format!("process group {pgid}: {error}")),
+        }
+    }
+    if let Some(scope) = scope {
+        match signal_scope(scope, signal) {
+            Ok(()) => delivered = true,
+            Err(error) => errors.push(format!("scope {}: {error:#}", scope.unit)),
         }
     }
     if delivered || errors.is_empty() || !managed_tree_running(pgid, scope) {
@@ -488,8 +645,7 @@ fn signal_scope(scope: &SystemdScope, signal: Signal) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     unblock_shutdown_signals(&mut command);
-    let status = command
-        .status()
+    let status = command_status_with_timeout(&mut command, SYSTEMD_COMMAND_TIMEOUT)
         .context("failed to execute systemctl kill")?;
     if !status.success() {
         bail!("systemctl kill exited with {status}");
@@ -533,7 +689,10 @@ fn wait_for_scope_cgroup(
         {
             return Ok(cgroup);
         }
-        if let Ok(cgroup) = query_scope_cgroup(support, unit) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero()
+            && let Ok(cgroup) = query_scope_cgroup(support, unit, remaining)
+        {
             return Ok(cgroup);
         }
         if Instant::now() >= deadline {
@@ -543,7 +702,7 @@ fn wait_for_scope_cgroup(
     }
 }
 
-fn query_scope_cgroup(support: &SystemdSupport, unit: &str) -> Result<PathBuf> {
+fn query_scope_cgroup(support: &SystemdSupport, unit: &str, timeout: Duration) -> Result<PathBuf> {
     let mut command = Command::new(&support.ctl);
     command
         .args([
@@ -557,13 +716,13 @@ fn query_scope_cgroup(support: &SystemdSupport, unit: &str) -> Result<PathBuf> {
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     unblock_shutdown_signals(&mut command);
-    let output = command
-        .output()
-        .context("failed to query systemd scope cgroup")?;
-    if !output.status.success() {
-        bail!("systemctl show exited with {}", output.status);
+    let (status, stdout) =
+        command_output_with_timeout(&mut command, timeout.min(SYSTEMD_COMMAND_TIMEOUT))
+            .context("failed to query systemd scope cgroup")?;
+    if !status.success() {
+        bail!("systemctl show exited with {status}");
     }
-    let relative = String::from_utf8(output.stdout).context("systemd scope cgroup is not UTF-8")?;
+    let relative = String::from_utf8(stdout).context("systemd scope cgroup is not UTF-8")?;
     let relative = relative.trim();
     if relative.is_empty() {
         bail!("systemd scope cgroup is empty");
@@ -694,6 +853,31 @@ pub fn paths(config_override: Option<PathBuf>) -> Result<AppPaths> {
     })
 }
 
+pub fn secure_paths(paths: &AppPaths) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for directory in [&paths.state_directory, &paths.log_directory] {
+        fs::create_dir_all(directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    if let Some(config_directory) = paths.config_file.parent()
+        && config_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("winkeeper"))
+    {
+        fs::create_dir_all(config_directory)?;
+        fs::set_permissions(config_directory, fs::Permissions::from_mode(0o700))?;
+    }
+    for entry in fs::read_dir(&paths.log_directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn configure_autostart(enabled: bool, config_file: &Path) -> Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -744,6 +928,7 @@ mod tests {
         let support = SystemdSupport {
             run: PathBuf::from("/usr/bin/systemd-run"),
             ctl: PathBuf::from("/usr/bin/systemctl"),
+            enabled: Arc::new(AtomicBool::new(true)),
         };
         let mut command = Command::new("/opt/example tool");
         command
@@ -769,6 +954,19 @@ mod tests {
         assert!(command.get_envs().any(|(key, value)| {
             key == "WINKEEPER_TEST_ENV" && value == Some(std::ffi::OsStr::new("present"))
         }));
+    }
+
+    #[test]
+    fn external_command_timeout_is_hard_bounded() {
+        let mut command = Command::new("/usr/bin/sleep");
+        command.arg("30");
+        let started = Instant::now();
+
+        let error =
+            command_status_with_timeout(&mut command, Duration::from_millis(50)).unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     fn process_group_or_pid_exists(pid: i32) -> bool {

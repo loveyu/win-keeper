@@ -37,6 +37,9 @@ pub struct AppPaths {
 
 pub trait ProcessGuard: Send {
     fn attach(&mut self, child: &Child) -> Result<()>;
+    fn check_health(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn request_graceful_stop(&self) -> Result<bool>;
     fn is_tree_running(&self) -> Result<bool>;
     fn force_stop(&self) -> Result<()>;
@@ -155,11 +158,11 @@ pub fn adapter() -> Arc<dyn PlatformAdapter> {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    configure_autostart, paths, prepare_shutdown_signals, run_process_watchdog, show_error,
-    wait_for_shutdown_signal,
+    configure_autostart, paths, prepare_shutdown_signals, run_process_watchdog, secure_paths,
+    show_error, wait_for_shutdown_signal,
 };
 #[cfg(windows)]
-pub use windows::{configure_autostart, paths, prepare_shutdown_signals, show_error};
+pub use windows::{configure_autostart, paths, prepare_shutdown_signals, secure_paths, show_error};
 
 #[cfg(not(any(target_os = "linux", windows)))]
 compile_error!("WinKeeper supports Windows and Linux only");

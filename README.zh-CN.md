@@ -30,7 +30,7 @@ Linux 面向 Debian/Ubuntu 桌面环境，支持 KDE Plasma 与 GNOME，以及 X
 - 点击任务立即查看实时输出、启动时间和运行时长
 - 内存中的实时日志缓冲与独立的工具管理器日志
 - 支持延迟和重启窗口限制的自动重启
-- 异步查看进程树；Windows 使用 Job Object，Linux 使用 Process Group 清理后代进程
+- 异步查看进程树；Windows 使用 Job Object，Linux 优先使用 systemd 用户 scope，并以 Process Group 兜底清理后代进程
 - 按需统计进程树内存，并在首次启动和后续重启后延迟自动采样
 - 当前用户级自动启动和单实例限制
 - 自动启动时最小化到任务栏、托盘控制、关闭到托盘
@@ -56,6 +56,9 @@ lang = "zh_CN"
 start_with_system = true
 minimize_to_tray = true
 log_buffer_lines = 10000
+log_buffer_bytes = 2097152
+log_file_max_bytes = 10485760
+log_line_max_bytes = 65536
 stop_timeout_ms = 30000
 
 [[tools]]
@@ -63,6 +66,9 @@ name = "worker"
 command = "C:\\Tools\\worker.exe"
 args = ["--config", "worker.toml"]
 workdir = "C:\\Tools"
+# 可选的优雅停止命令；执行时 WINKEEPER_PID 为受管根进程 PID
+# graceful_stop_command = "C:\\Tools\\example-worker-control.exe"
+# graceful_stop_args = ["stop"]
 admin = false
 auto_start = true
 auto_restart = true
@@ -104,7 +110,7 @@ CI 使用原生 GitHub Runner 构建 Windows x86_64/ARM64 与 Linux x86_64/ARM64
 
 ```text
 src/core       平台无关的配置、日志、状态机和进程监督器
-src/platform   Windows Job/注册表/内存与 Linux 进程组/XDG/proc 适配器
+src/platform   Windows Job/注册表/内存与 Linux systemd scope/进程组/XDG/proc 适配器
 ui             共用的 Slint 管理器和 SystemTrayIcon
 ```
 

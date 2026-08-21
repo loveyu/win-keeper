@@ -30,7 +30,7 @@ Linux targets Debian/Ubuntu desktop environments, KDE Plasma and GNOME, on X11 o
 - Click-to-select live output with start time and uptime
 - In-memory live log buffer and a dedicated manager log
 - Automatic restart with delay and restart-window limiting
-- Asynchronous process-tree inspection with Windows Job Objects and Linux process groups for descendant cleanup
+- Asynchronous process-tree inspection with Windows Job Objects and Linux systemd user scopes, with process groups as the descendant-cleanup fallback
 - Process-tree memory sampling on demand and delayed sampling after startup or restart
 - Native per-user autostart integration
 - Per-user single-instance enforcement
@@ -57,6 +57,9 @@ lang = "zh_CN"
 start_with_system = true
 minimize_to_tray = true
 log_buffer_lines = 10000
+log_buffer_bytes = 2097152
+log_file_max_bytes = 10485760
+log_line_max_bytes = 65536
 stop_timeout_ms = 30000
 
 [[tools]]
@@ -64,6 +67,9 @@ name = "worker"
 command = "C:\\Tools\\worker.exe"
 args = ["--config", "worker.toml"]
 workdir = "C:\\Tools"
+# Optional graceful stop hook; WINKEEPER_PID is set to the managed root PID.
+# graceful_stop_command = "C:\\Tools\\example-worker-control.exe"
+# graceful_stop_args = ["stop"]
 admin = false
 auto_start = true
 auto_restart = true
