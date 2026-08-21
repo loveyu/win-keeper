@@ -10,6 +10,8 @@ use core::{
     single_instance::SingleInstanceGuard,
     supervisor::Supervisor,
 };
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 
 fn main() {
@@ -26,6 +28,18 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
+    if let Some(watchdog) = args.process_watchdog {
+        #[cfg(target_os = "linux")]
+        {
+            let (pgid, timeout_ms) = watchdog;
+            return platform::run_process_watchdog(pgid, Duration::from_millis(timeout_ms));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = watchdog;
+            anyhow::bail!("--process-watchdog is supported on Linux only");
+        }
+    }
     if args.elevated_helper {
         #[cfg(windows)]
         {
@@ -95,6 +109,7 @@ struct Args {
     elevated_helper: bool,
     manifest: Option<PathBuf>,
     state_directory: Option<PathBuf>,
+    process_watchdog: Option<(i32, u64)>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -120,6 +135,21 @@ fn parse_args() -> Result<Args> {
                 parsed.state_directory = Some(PathBuf::from(
                     args.next().context("--state-dir requires a path")?,
                 ));
+            }
+            "--process-watchdog" => {
+                let pgid = args
+                    .next()
+                    .context("--process-watchdog requires a process group id")?
+                    .to_string_lossy()
+                    .parse::<i32>()
+                    .context("invalid process group id")?;
+                let timeout_ms = args
+                    .next()
+                    .context("--process-watchdog requires a stop timeout")?
+                    .to_string_lossy()
+                    .parse::<u64>()
+                    .context("invalid watchdog stop timeout")?;
+                parsed.process_watchdog = Some((pgid, timeout_ms));
             }
             "--version" | "-V" => {
                 println!("win-keeper {}", env!("CARGO_PKG_VERSION"));

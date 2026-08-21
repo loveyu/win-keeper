@@ -480,6 +480,7 @@ fn worker_loop(
             match active.child.try_wait() {
                 Ok(Some(status)) => {
                     log.write("manager", &format!("process exited with {status}"));
+                    stop_remaining_process_tree(active.guard.as_ref(), &log, stop_timeout);
                     process = None;
                     let mut state = runtime.lock().unwrap();
                     state.pid = None;
@@ -522,7 +523,7 @@ fn worker_loop(
             && next_start.is_some_and(|deadline| Instant::now() >= deadline)
         {
             next_start = None;
-            match start_process(&config, &runtime, &log, platform.as_ref()) {
+            match start_process(&config, &runtime, &log, platform.as_ref(), stop_timeout) {
                 Ok(started) => {
                     let delays = if has_started_once {
                         vec![Duration::from_secs(5)]
@@ -662,6 +663,7 @@ fn start_process(
     runtime: &Arc<Mutex<Runtime>>,
     log: &Arc<ToolLog>,
     platform: &dyn PlatformAdapter,
+    stop_timeout: Duration,
 ) -> Result<ManagedProcess> {
     runtime.lock().unwrap().state = ToolState::Starting;
     let mut command = Command::new(&config.command);
@@ -676,12 +678,14 @@ fn start_process(
         }
         command.current_dir(workdir);
     }
-    let mut guard = platform.prepare_command(&mut command, config)?;
+    let mut guard = platform.prepare_command(&mut command, config, stop_timeout)?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to execute {}", config.command))?;
     if let Err(error) = guard.attach(&child) {
+        let _ = guard.force_stop();
         let _ = child.kill();
+        let _ = child.wait();
         return Err(error);
     }
     let pid = child.id();
@@ -700,6 +704,33 @@ fn start_process(
     }
     log.write("manager", &format!("process started, pid={pid}"));
     Ok(ManagedProcess { child, guard })
+}
+
+fn stop_remaining_process_tree(guard: &dyn ProcessGuard, log: &ToolLog, timeout: Duration) {
+    if !guard.is_tree_running().unwrap_or(false) {
+        return;
+    }
+    log.write(
+        "manager",
+        "root process exited; stopping remaining process tree",
+    );
+    if guard.request_graceful_stop().unwrap_or(false) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !guard.is_tree_running().unwrap_or(true) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if guard.is_tree_running().unwrap_or(true)
+        && let Err(error) = guard.force_stop()
+    {
+        log.write(
+            "manager",
+            &format!("failed to stop remaining process tree: {error:#}"),
+        );
+    }
 }
 
 fn spawn_reader(

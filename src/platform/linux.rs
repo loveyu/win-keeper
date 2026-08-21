@@ -5,20 +5,33 @@ use crate::core::config::ToolConfig;
 use anyhow::{Context, Result, bail};
 use nix::{
     errno::Errno,
-    sys::signal::{SigSet, Signal, kill, killpg},
-    unistd::Pid,
+    sys::{
+        prctl,
+        signal::{SigSet, Signal, kill, killpg},
+    },
+    unistd::{Pid, getpid, getppid},
 };
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::atomic::{AtomicI32, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 pub struct LinuxAdapter;
 
 struct ProcessGroup {
     pgid: AtomicI32,
+    stop_timeout: Duration,
+    watchdog: Option<Watchdog>,
+}
+
+struct Watchdog {
+    child: Child,
+    control: Option<ChildStdin>,
 }
 
 impl PlatformAdapter for LinuxAdapter {
@@ -26,22 +39,35 @@ impl PlatformAdapter for LinuxAdapter {
         &self,
         command: &mut Command,
         config: &ToolConfig,
+        stop_timeout: Duration,
     ) -> Result<Box<dyn ProcessGuard>> {
         if config.admin {
             bail!("admin=true requires Polkit support, which is outside the first-stage Linux MVP");
         }
         use std::os::unix::process::CommandExt;
+        let manager_pid = getpid();
         command.process_group(0);
         // The manager blocks shutdown signals for its sigwait thread; children must not inherit it.
+        // PDEATHSIG covers the short window before the process-group watchdog is attached.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 shutdown_signals()
                     .thread_unblock()
-                    .map_err(std::io::Error::from)
+                    .map_err(std::io::Error::from)?;
+                prctl::set_pdeathsig(Signal::SIGTERM).map_err(std::io::Error::from)?;
+                if getppid() != manager_pid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "WinKeeper exited before the process watchdog was attached",
+                    ));
+                }
+                Ok(())
             });
         }
         Ok(Box::new(ProcessGroup {
             pgid: AtomicI32::new(0),
+            stop_timeout,
+            watchdog: None,
         }))
     }
 
@@ -122,7 +148,9 @@ impl PlatformAdapter for LinuxAdapter {
 
 impl ProcessGuard for ProcessGroup {
     fn attach(&mut self, child: &Child) -> Result<()> {
-        self.pgid.store(child.id() as i32, Ordering::Release);
+        let pgid = child.id() as i32;
+        self.pgid.store(pgid, Ordering::Release);
+        self.watchdog = Some(spawn_watchdog(pgid, self.stop_timeout)?);
         Ok(())
     }
 
@@ -153,6 +181,108 @@ impl ProcessGuard for ProcessGroup {
         }
         Ok(())
     }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let Some(mut watchdog) = self.watchdog.take() else {
+            return;
+        };
+        if let Some(mut control) = watchdog.control.take() {
+            let _ = control.write_all(b"D");
+        }
+        let _ = watchdog.child.wait();
+    }
+}
+
+fn spawn_watchdog(pgid: i32, stop_timeout: Duration) -> Result<Watchdog> {
+    use std::os::unix::process::CommandExt;
+
+    let timeout_ms = u64::try_from(stop_timeout.as_millis()).unwrap_or(u64::MAX);
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("--process-watchdog")
+        .arg(pgid.to_string())
+        .arg(timeout_ms.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            shutdown_signals()
+                .thread_unblock()
+                .map_err(std::io::Error::from)
+        });
+    }
+    let mut child = command
+        .spawn()
+        .context("failed to start process watchdog")?;
+    let control = child
+        .stdin
+        .take()
+        .context("process watchdog control pipe is unavailable")?;
+    let mut ready_pipe = child
+        .stdout
+        .take()
+        .context("process watchdog readiness pipe is unavailable")?;
+    let mut ready = [0_u8; 1];
+    if ready_pipe.read_exact(&mut ready).is_err() || ready[0] != b'R' {
+        drop(control);
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("process watchdog failed to become ready");
+    }
+    Ok(Watchdog {
+        child,
+        control: Some(control),
+    })
+}
+
+pub fn run_process_watchdog(pgid: i32, stop_timeout: Duration) -> Result<()> {
+    if pgid <= 0 {
+        bail!("process watchdog requires a positive process group id");
+    }
+    {
+        let mut ready = std::io::stdout().lock();
+        ready
+            .write_all(b"R")
+            .context("failed to report process watchdog readiness")?;
+        ready
+            .flush()
+            .context("failed to flush process watchdog readiness")?;
+    }
+    let mut command = [0_u8; 1];
+    loop {
+        match std::io::stdin().read(&mut command) {
+            Ok(0) => break,
+            Ok(_) if command[0] == b'D' => return Ok(()),
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    stop_process_group(pgid, stop_timeout);
+    Ok(())
+}
+
+fn stop_process_group(pgid: i32, timeout: Duration) {
+    let pid = Pid::from_raw(pgid);
+    let _ = killpg(pid, Signal::SIGTERM);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_group_running(pgid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if process_group_running(pgid) {
+        let _ = killpg(pid, Signal::SIGKILL);
+    }
+}
+
+fn process_group_running(pgid: i32) -> bool {
+    matches!(kill(Pid::from_raw(-pgid), None), Ok(()) | Err(Errno::EPERM))
 }
 
 fn shutdown_signals() -> SigSet {

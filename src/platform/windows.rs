@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     ptr::{null, null_mut},
+    time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE},
@@ -52,6 +53,7 @@ impl PlatformAdapter for WindowsAdapter {
         &self,
         command: &mut Command,
         config: &ToolConfig,
+        _stop_timeout: Duration,
     ) -> Result<Box<dyn ProcessGuard>> {
         if config.admin {
             bail!(

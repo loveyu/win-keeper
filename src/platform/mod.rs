@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::Arc,
+    time::Duration,
 };
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,7 @@ pub trait PlatformAdapter: Send + Sync {
         &self,
         command: &mut Command,
         config: &ToolConfig,
+        stop_timeout: Duration,
     ) -> Result<Box<dyn ProcessGuard>>;
     fn memory_usage(&self, pid: u32) -> Result<u64>;
     fn process_tree(&self, root_pid: u32) -> Result<Vec<ProcessInfo>>;
@@ -124,7 +126,8 @@ pub fn adapter() -> Arc<dyn PlatformAdapter> {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    configure_autostart, paths, prepare_shutdown_signals, show_error, wait_for_shutdown_signal,
+    configure_autostart, paths, prepare_shutdown_signals, run_process_watchdog, show_error,
+    wait_for_shutdown_signal,
 };
 #[cfg(windows)]
 pub use windows::{configure_autostart, paths, prepare_shutdown_signals, show_error};
