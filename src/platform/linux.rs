@@ -882,7 +882,10 @@ pub fn configure_autostart(enabled: bool, config_file: &Path) -> Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")?;
-    let directory = home.join(".config/autostart");
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let directory = config_home.join("autostart");
     let desktop = directory.join("winkeeper.desktop");
     if !enabled {
         if desktop.exists() {
@@ -892,16 +895,29 @@ pub fn configure_autostart(enabled: bool, config_file: &Path) -> Result<()> {
     }
     fs::create_dir_all(directory)?;
     let exe = std::env::current_exe()?;
-    let quote = |path: &Path| format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""));
-    fs::write(
-        desktop,
-        format!(
-            "[Desktop Entry]\nType=Application\nName=WinKeeper\nComment=Cross-platform process supervisor\nExec={} --config {} --autostart\nIcon=win-keeper\nStartupWMClass=win-keeper\nTerminal=false\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n",
-            quote(&exe),
-            quote(config_file)
-        ),
-    )?;
+    let contents = autostart_entry(&exe, config_file);
+    let unchanged = fs::read_to_string(&desktop).is_ok_and(|current| current == contents);
+    if !unchanged {
+        fs::write(desktop, contents)?;
+    }
     Ok(())
+}
+
+fn autostart_entry(exe: &Path, config_file: &Path) -> String {
+    let quote = |path: &Path| format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""));
+    let string = |path: &Path| {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+            .replace('\r', "\\r")
+    };
+    format!(
+        "[Desktop Entry]\nType=Application\nName=WinKeeper\nComment=Cross-platform process supervisor\nTryExec={}\nExec={} --config {} --autostart\nIcon=win-keeper\nStartupWMClass=win-keeper\nTerminal=false\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n",
+        string(exe),
+        quote(exe),
+        quote(config_file)
+    )
 }
 
 pub fn show_error(title: &str, message: &str) {
@@ -911,6 +927,19 @@ pub fn show_error(title: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autostart_entry_checks_the_executable_before_launching() {
+        let entry = autostart_entry(
+            Path::new("/opt/Win Keeper/win-keeper"),
+            Path::new("/home/example/.config/winkeeper/config.toml"),
+        );
+
+        assert!(entry.contains("TryExec=/opt/Win Keeper/win-keeper\n"));
+        assert!(entry.contains(
+            "Exec=\"/opt/Win Keeper/win-keeper\" --config \"/home/example/.config/winkeeper/config.toml\" --autostart\n"
+        ));
+    }
 
     #[test]
     fn detached_child_is_reaped() {
