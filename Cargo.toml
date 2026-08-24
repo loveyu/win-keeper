@@ -47,3 +47,8 @@ lto = "thin"
 opt-level = "s"
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+# ksni 0.3.6 leaves its service loop alive after the last handle is dropped and panics when the
+# session D-Bus subsequently disappears. Keep this local patch until the upstream fix is released.
+ksni = { path = "vendor/ksni" }

@@ -106,11 +106,13 @@ pub fn run(supervisor: Arc<Supervisor>, show_window: bool) -> Result<()> {
         })?;
     // Keep minimized startup alive until the user exits from the window or tray.
     let result = slint::run_event_loop_until_quit();
-    supervisor.shutdown();
     drop(activation_timer);
     drop(log_timer);
     drop(state_timer);
+    // Tear down the Linux StatusNotifierItem before stopping managed processes. Session shutdown
+    // may remove D-Bus while process cleanup is still running, and the tray must not outlive it.
     drop(tray);
+    supervisor.shutdown();
     drop(window);
     result.map_err(Into::into)
 }
