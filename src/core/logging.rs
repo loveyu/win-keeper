@@ -8,6 +8,18 @@ use std::{
     sync::Mutex,
 };
 
+/// UI 快照窗口限制。
+///
+/// Slint 软件渲染器用 i16 存储物理像素坐标（上限 32767）。日志若全量塞进
+/// TextEdit，文档高度轻易超过该上限，滚动或选中文字时渲染器会把滚动后的
+/// item 偏移 cast 成 i16 而触发 panic（2026-09-02 崩溃的根因）。因此 UI
+/// 快照只输出尾部窗口：限制行数与总字节数，并给每行设置显示上限，保证
+/// word-wrap 折行后（含 HiDPI 缩放）文档高度仍留足余量；更早的历史通过
+/// 日志文件查看（管理器已有"打开日志"入口）。
+const SNAPSHOT_MAX_LINES: usize = 400;
+const SNAPSHOT_MAX_BYTES: usize = 48 * 1024;
+const SNAPSHOT_LINE_MAX_BYTES: usize = 2 * 1024;
+
 pub struct ToolLog {
     path: PathBuf,
     line_capacity: usize,
@@ -176,7 +188,7 @@ impl ToolLog {
     pub fn snapshot(&self) -> String {
         self.inner
             .lock()
-            .map(|inner| inner.lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .map(|inner| format_snapshot(&inner.lines))
             .unwrap_or_default()
     }
 
@@ -220,7 +232,7 @@ impl ToolLog {
                 }
             }
         }
-        inner.lines.iter().cloned().collect::<Vec<_>>().join("\n")
+        format_snapshot(&inner.lines)
     }
 
     pub fn path(&self) -> &Path {
@@ -285,6 +297,44 @@ fn push_bounded(inner: &mut LogInner, line: String, line_capacity: usize, byte_c
         };
         inner.buffered_bytes = inner.buffered_bytes.saturating_sub(line.len());
     }
+}
+
+/// 按尾部窗口拼接缓冲行，供 UI 展示。行数或字节超限时丢弃最早的行，并在
+/// 开头输出省略提示；单行超过显示上限时截断并标记。约束推导见
+/// SNAPSHOT_MAX_* 常量注释。
+fn format_snapshot(lines: &VecDeque<String>) -> String {
+    let total = lines.len();
+    let mut start = total;
+    let mut kept_bytes = 0usize;
+    while start > 0 {
+        let line_len = lines[start - 1].len().min(SNAPSHOT_LINE_MAX_BYTES);
+        // 字节超限时至少保留最新一行，避免极端情况下输出为空
+        if start < total && kept_bytes + line_len > SNAPSHOT_MAX_BYTES {
+            break;
+        }
+        if total - start >= SNAPSHOT_MAX_LINES {
+            break;
+        }
+        start -= 1;
+        kept_bytes += line_len;
+    }
+    let mut output = String::new();
+    if start > 0 {
+        output.push_str(&format!(
+            "… {start} earlier lines omitted; open the log file for full history\n"
+        ));
+    }
+    for (index, line) in lines.iter().skip(start).enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let (text, truncated) = truncate_utf8(line, SNAPSHOT_LINE_MAX_BYTES);
+        output.push_str(text);
+        if truncated {
+            output.push_str(" …[truncated]");
+        }
+    }
+    output
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> (&str, bool) {
@@ -431,6 +481,60 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_limits_display_window_and_marks_omission() {
+        let directory = test_directory("snapshot-window");
+        // 缓冲容量给足（1000 行 / 4MB），只考察 UI 窗口截断
+        let log = ToolLog::new(
+            &directory,
+            "windowed",
+            1000,
+            4 * 1024 * 1024,
+            10 * 1024 * 1024,
+            64 * 1024,
+        )
+        .unwrap();
+        let written = SNAPSHOT_MAX_LINES + 50;
+        for index in 0..written {
+            log.write("stdout", &format!("line-{index:04}"));
+        }
+
+        let snapshot = log.snapshot();
+        let lines: Vec<&str> = snapshot.lines().collect();
+        // 省略提示行 + 至多 SNAPSHOT_MAX_LINES 行内容
+        assert_eq!(lines.len(), SNAPSHOT_MAX_LINES + 1);
+        assert!(lines[0].contains("earlier lines omitted"));
+        // 窗口从被省略行的下一行开始，最新一行必须保留
+        assert!(snapshot.contains(&format!("line-{:04}", written - SNAPSHOT_MAX_LINES)));
+        assert!(!snapshot.contains("line-0049\n"));
+        assert!(snapshot.contains(&format!("line-{:04}", written - 1)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snapshot_truncates_overlong_lines() {
+        let directory = test_directory("snapshot-line-cap");
+        let log = ToolLog::new(
+            &directory,
+            "longline",
+            10,
+            4 * 1024 * 1024,
+            10 * 1024 * 1024,
+            64 * 1024,
+        )
+        .unwrap();
+        log.write("stdout", &"x".repeat(SNAPSHOT_LINE_MAX_BYTES + 4096));
+
+        let snapshot = log.snapshot();
+        assert!(snapshot.contains("…[truncated]"));
+        // 单行输出（时间戳前缀 + 截断后缀）仍受限，防止折行撑爆文档高度
+        for line in snapshot.lines() {
+            assert!(line.len() < SNAPSHOT_LINE_MAX_BYTES + 128);
+        }
+        assert!(!snapshot.contains("earlier lines omitted"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

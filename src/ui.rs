@@ -253,6 +253,10 @@ fn wire_window(window: &AppWindow, supervisor: Arc<Supervisor>) {
     });
 }
 
+/// 进程树视图是 no-wrap 文本，横向坐标同样受软件渲染器 i16 上限约束；
+/// 进程名可能来自超长 cmdline（数千字符），显示时按字符数截断。
+const PROCESS_NAME_DISPLAY_CHARS: usize = 160;
+
 fn format_process_tree(processes: &[crate::platform::ProcessInfo], chinese: bool) -> String {
     if processes.is_empty() {
         return tr(chinese, "The process has exited.", "进程已退出。").into();
@@ -285,9 +289,21 @@ fn format_process_tree(processes: &[crate::platform::ProcessInfo], chinese: bool
             .memory_bytes
             .map(|bytes| format_memory(MemoryValue::Bytes(bytes), chinese))
             .unwrap_or_else(|| tr(chinese, "N/A", "不可用").into());
+        // 超长 cmdline 只保留前缀，避免 no-wrap 行把横向坐标推出渲染器上限
+        let display_name = if process.name.chars().count() > PROCESS_NAME_DISPLAY_CHARS {
+            let mut short: String = process
+                .name
+                .chars()
+                .take(PROCESS_NAME_DISPLAY_CHARS)
+                .collect();
+            short.push('…');
+            short
+        } else {
+            process.name.clone()
+        };
         output.push_str(&format!(
             "{:<7} {:<7} {:>10}    {branch}{}\n",
-            process.pid, process.parent_pid, memory, process.name
+            process.pid, process.parent_pid, memory, display_name
         ));
     }
     output
